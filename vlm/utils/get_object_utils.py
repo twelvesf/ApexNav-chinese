@@ -1,3 +1,5 @@
+import re
+
 import cv2
 import numpy as np
 from vlm.coco_classes import COCO_CLASSES
@@ -11,6 +13,65 @@ yolov7_detector = YOLOv7Client(port=12184)
 blip2_itm = BLIP2ITMClient(port=12182)
 sam_segmentor = MobileSAMClient(port=12183)
 dino_detector = GroundingDINOClient(port=12181)
+
+
+def _normalize_label(text):
+    text = str(text).lower().replace("#", "")
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return " ".join(text.split())
+
+
+def _label_tokens(text):
+    return {token for token in _normalize_label(text).split() if len(token) >= 2}
+
+
+def _dedupe_labels(labels):
+    unique = []
+    seen = set()
+    for label in labels:
+        norm = _normalize_label(label)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        unique.append(str(label).strip())
+    return unique
+
+
+def _match_label_index(label_detected, primary_labels, all_labels):
+    detected_norm = _normalize_label(label_detected)
+    detected_tokens = _label_tokens(label_detected)
+    if not detected_tokens:
+        return None
+
+    primary_norms = [_normalize_label(label) for label in primary_labels]
+    all_norms = [_normalize_label(label) for label in all_labels]
+
+    for norm in primary_norms:
+        if detected_norm == norm:
+            return 0
+
+    for idx, norm in enumerate(all_norms):
+        if detected_norm == norm:
+            return 0 if idx < len(primary_labels) else idx - len(primary_labels) + 1
+
+    best_primary_overlap = max(
+        (len(detected_tokens & _label_tokens(label)) for label in primary_labels),
+        default=0,
+    )
+    if best_primary_overlap > 0:
+        return 0
+
+    best_idx = None
+    best_overlap = 0
+    for idx, label in enumerate(all_labels):
+        overlap = len(detected_tokens & _label_tokens(label))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_idx = idx
+
+    if best_idx is None or best_overlap == 0:
+        return None
+    return 0 if best_idx < len(primary_labels) else best_idx - len(primary_labels) + 1
 
 
 def get_segmentation(segmented_img, idx, detections, img, label, score, color):
@@ -70,9 +131,9 @@ def get_object(right_label, img, cfg, similar_answer):
     label_list = []
     coco_label = []
     dino_label = []
-    right_label_list = list(map(str.strip, right_label.split('|')))
+    right_label_list = _dedupe_labels(map(str.strip, right_label.split('|')))
     # print(f"right_label_list: {right_label_list}")
-    all_answer = right_label_list + similar_answer
+    all_answer = _dedupe_labels(right_label_list + similar_answer)
     for label in all_answer:
         if label in COCO_CLASSES:
             coco_label.append(label)
@@ -92,20 +153,21 @@ def get_object(right_label, img, cfg, similar_answer):
         for idx in range(len(detections.logits)):
             label_detected = detections.phrases[idx]
             score = detections.logits[idx].item()
-            if detections.phrases[idx] in right_label_list:
+            matched_idx = _match_label_index(label_detected, right_label_list, all_answer)
+            if matched_idx == 0:
                 segmented_img, object_mask = get_segmentation(
                     segmented_img, idx, detections, img, label_detected, score, color=(255, 0, 0)
                 )
                 score_list.append(score)
                 object_masks_list.append(object_mask)
                 label_list.append(0)
-            elif detections.phrases[idx] in coco_label:
+            elif matched_idx is not None:
                 segmented_img, object_mask = get_segmentation(
                     segmented_img, idx, detections, img, label_detected, score, color=(0, 255, 0)
                 )
                 score_list.append(score)
                 object_masks_list.append(object_mask)
-                label_list.append(list(all_answer).index(label_detected) - len(right_label_list)+1)
+                label_list.append(matched_idx)
 
     if dino_label:
         caption = ' '.join(f'{item}.  ' for item in dino_label)
@@ -114,21 +176,21 @@ def get_object(right_label, img, cfg, similar_answer):
         for idx in range(len(detections.logits)):
             label_detected = detections.phrases[idx]
             score = detections.logits[idx].item()
-            if label_detected in right_label_list:
+            matched_idx = _match_label_index(label_detected, right_label_list, all_answer)
+            if matched_idx == 0:
                 segmented_img, object_mask = get_segmentation(
                     segmented_img, idx, detections, img, label_detected, score, color=(255, 0, 0)
                 )
                 score_list.append(score)
                 object_masks_list.append(object_mask)
                 label_list.append(0)
-
-            elif label_detected in dino_label:
+            elif matched_idx is not None:
                 segmented_img, object_mask = get_segmentation(
                     segmented_img, idx, detections, img, label_detected, score, color=(0, 255, 0)
                 )
                 score_list.append(score)
                 object_masks_list.append(object_mask)
-                label_list.append(list(all_answer).index(label_detected) - len(right_label_list)+1)
+                label_list.append(matched_idx)
 
     return segmented_img, score_list, object_masks_list, label_list
 
@@ -197,4 +259,3 @@ def crop_and_expand_box(img, detections, idx, expand_pixels=0.4):
     img_detected = img[y_min:y_max+1, x_min:x_max+1]
 
     return img_detected
-

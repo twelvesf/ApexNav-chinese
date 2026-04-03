@@ -11,6 +11,12 @@ import requests
 from flask import Flask, jsonify, request
 
 
+LOCAL_BYPASS_PROXIES = {
+    "http": None,
+    "https": None,
+}
+
+
 class ServerMixin:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -68,19 +74,30 @@ def str_to_image(img_str: str) -> np.ndarray:
 
 def send_request(url: str, **kwargs: Any) -> dict:
     response = {}
-    for attempt in range(10):
+    local_request = "localhost" in url or "127.0.0.1" in url
+    max_attempts = 3 if local_request else 10
+    retry_min = 0.5 if local_request else 20.0
+    retry_jitter = 0.2 if local_request else 10.0
+    last_error = None
+
+    for attempt in range(max_attempts):
         try:
             response = _send_request(url, **kwargs)
             break
         except Exception as e:
-            if attempt == 9:
-                print(e)
-                exit()
-            else:
-                print(f"Error: {e}. Retrying in 20-30 seconds...")
-                time.sleep(20 + random.random() * 10)
+            last_error = e
+            if attempt == max_attempts - 1:
+                raise RuntimeError(f"Request to {url} failed after {max_attempts} attempts: {e}") from e
 
-    return response
+            sleep_time = retry_min + random.random() * retry_jitter
+            print(
+                f"Error: {e}. Retrying request to {url} in {sleep_time:.2f} seconds..."
+            )
+            time.sleep(sleep_time)
+
+    if response:
+        return response
+    raise RuntimeError(f"Request to {url} failed: {last_error}")
 
 
 def _send_request(url: str, **kwargs: Any) -> dict:
@@ -130,7 +147,13 @@ def _send_request(url: str, **kwargs: Any) -> dict:
         start_time = time.time()
         while True:
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=1)
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=1,
+                    proxies=LOCAL_BYPASS_PROXIES,
+                )
                 if resp.status_code == 200:
                     result = resp.json()
                     break

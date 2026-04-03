@@ -1,3 +1,12 @@
+# GroundingDINO 的模型封装 + 客户端/服务端接口层
+# 开放词汇目标检测器
+# 处理不在COCO_CLASSES里的目标对象
+# GroundingDINO 接收 caption，返回候选框和得分
+
+# 输入：图像 + 文本提示词，比如 "chair . plant . laptop ."
+# 输出：哪些位置可能有这些物体的 bounding box 检测框，以及对应分数、类别文字
+
+
 from typing import Optional
 
 import numpy as np
@@ -32,7 +41,13 @@ class GroundingDINO:
             model_config_path=config_path, model_checkpoint_path=weights_path
         ).to(device)
         self.caption = caption
+# Optional[T] 的意思是：
 
+# T | None
+# Optional[str] = None,
+# 默认为None
+# Optional[float] = 0.35
+# 默认为float类型，数值0.35
     def predict(
         self,
         image: np.ndarray,
@@ -53,8 +68,8 @@ class GroundingDINO:
             ObjectDetections: An instance of the ObjectDetections class containing the
                 object detections.
         """
-        image_tensor = F.to_tensor(image)
-        image_transformed = F.normalize(
+        image_tensor = F.to_tensor(image) #numpy图像转化为pytorch张量
+        image_transformed = F.normalize(    #归一化，视觉模型预处理
             image_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         )
 
@@ -63,7 +78,7 @@ class GroundingDINO:
         else:
             caption_to_use = caption
         print("GroundingDINO is detecting. Caption:", caption_to_use)
-        with torch.inference_mode():
+        with torch.inference_mode():    #调用groundingdino做推理，从groundingdino导入的官方推理函数
             boxes, logits, phrases = predict(
                 model=self.model,
                 image=image_transformed,
@@ -71,7 +86,8 @@ class GroundingDINO:
                 box_threshold=box_threshold,
                 text_threshold=text_threshold,
             )
-        detections = ObjectDetections(boxes, logits, phrases, image_source=image)
+        detections = ObjectDetections(boxes, logits, phrases, image_source=image)   
+        #输出整理成apexnav统一使用的检测结果对象
 
         # Remove detections whose class names do not exactly match the provided classes
         # classes = caption_to_use[: -len(" .")].split(" . ")
@@ -110,7 +126,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("Loading model...")
-
+#CLIENT-SERVER服务模型
     class GroundingDINOServer(ServerMixin, GroundingDINO):
         def process_payload(self, payload: dict) -> dict:
             image = str_to_image(payload["image"])

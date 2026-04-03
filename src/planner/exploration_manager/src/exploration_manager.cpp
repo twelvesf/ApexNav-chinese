@@ -63,18 +63,20 @@ void ExplorationManager::initialize(ros::NodeHandle& nh)
   
   ROS_INFO("[ExplorationManager] KinoAstar and GCopter initialized for real-world mode");
 }
-
+//决定下一步应该去追哪个目标，以及给出一条 2D 粗路径。
+// 当前状态 -> 先看目标物体 -> 不行再看 frontier -> 还不行就极端兜底
 int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw)
 {
-  Vector2d pos2d = Vector2d(pos(0), pos(1));
+  Vector2d pos2d = Vector2d(pos(0), pos(1));//路径起始点坐标
   ros::Time t1 = ros::Time::now();
   auto t2 = t1;
 
   // Clear previous planning results
   ed_->tsp_tour_.clear();
   ed_->next_best_path_.clear();
+  // 定义一个数组，里面每个元素都是“一个点云的智能指针”。点云列表
   vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> object_clouds;
-  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds);
+  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds);//严格模式
 
   // ==================== Navigation Mode: High-Confidence Objects ====================
   if (!object_clouds.empty()) {
@@ -82,11 +84,12 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
 
     // Try to find path to each detected object in order of confidence
     for (auto object_cloud : object_clouds) {
+      //给定当前机器人位置和一个目标对象点云，尝试找一条能靠近该对象的 2D 路径。
       if (searchObjectPath(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_))
         return SEARCH_BEST_OBJECT;
     }
   }
-
+  //看见了，但太远，还不够确定的目标对象
   // ==================== Navigation Mode: Over-Depth Objects ====================
   if (!object_map2d_->over_depth_object_cloud_->points.empty()) {
     ROS_WARN("[Navigation Mode (Over Depth)] Get over depth object cloud");
@@ -96,6 +99,7 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   }
 
   // ==================== Exploration Mode: Frontier-Based Planning ====================
+  // 先缓存一个“最可疑的对象候选”，以防 frontier 路径找不到时还能退回去追它。
   sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false);
   pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> top_object_cloud(
       new pcl::PointCloud<pcl::PointXYZ>);
@@ -105,13 +109,14 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   // Apply selected exploration policy to choose next frontier
   Eigen::Vector2d next_best_pos;
   std::vector<Eigen::Vector2d> next_best_path;
+  //探索策略
   chooseExplorationPolicy(pos2d, ed_->frontier_averages_, next_best_pos, next_best_path);
 
   // Handle case when no passable frontiers are found
   if (next_best_path.empty()) {
     ROS_WARN("Maybe no passable frontier.");
 
-    // Try suspicious objects as backup
+    // Try suspicious objects as backup 找不到可达frontier 去找最可疑的对象候选
     if (!top_object_cloud->points.empty() &&
         searchObjectPath(pos, top_object_cloud, ed_->next_pos_, ed_->next_best_path_))
       return SEARCH_SUSPICIOUS_OBJECT;
@@ -124,14 +129,14 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
     if (next_best_path.empty()) {
       ROS_ERROR("search exterme case!!!");
 
-      // Try extreme object search with relaxed constraints
+      // Try extreme object search with relaxed constraints 对非严格模式下的对象进行extreme路径搜索 放宽了路径搜索约束
       for (auto object_cloud : object_clouds) {
         if (!object_cloud->points.empty() &&
             searchObjectPathExtreme(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_))
           return SEARCH_EXTREME;
       }
 
-      // Include lower confidence objects in extreme search
+      // Include lower confidence objects in extreme search 既放宽了对象候选集合本身，又放宽了路径搜索约束
       sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false, true);
       for (auto object_cloud : object_clouds) {
         if (!object_cloud->points.empty() &&
@@ -140,6 +145,9 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
       }
 
       // Try cached over-depth objects as final option
+      //放宽了目标候选的时效性
+      //last_over_depth_object_cloud：跨周期缓存的object cloud
+      //即使当前帧已经看不到 over-depth 目标了，只要历史缓存里还保留着，就再极限尝试一次。
       static auto last_over_depth_object_cloud = object_map2d_->over_depth_object_cloud_;
       if (!object_map2d_->over_depth_object_cloud_->points.empty())
         last_over_depth_object_cloud = object_map2d_->over_depth_object_cloud_;
@@ -165,6 +173,7 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   }
 
   // Store successful planning results
+  //ed_ 里主要存高层探索得到的目标点和 2D 粗路径
   ed_->next_pos_ = next_best_pos;
   ed_->next_best_path_ = next_best_path;
 
@@ -174,7 +183,7 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
 
   return EXPLORATION;
 }
-
+//根据当前配置的探索策略，决定用哪一种 frontier 选择方法
 void ExplorationManager::chooseExplorationPolicy(Vector2d cur_pos, vector<Vector2d> frontiers,
     Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
 {
@@ -204,26 +213,33 @@ void ExplorationManager::chooseExplorationPolicy(Vector2d cur_pos, vector<Vector
       break;
   }
 }
-
+//先看当前所有 frontier 的语义价值分布，如果语义热点足够明显，就优先去追高语义 frontier；
+//如果不明显，就退回普通几何探索，去最近 frontier
+//输出下一个点坐标和路径
 void ExplorationManager::hybridExplorePolicy(Vector2d cur_pos, vector<Vector2d> frontiers,
     Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
 {
+  //语义 frontier 值标准差的阈值，判断当前各个frontier语义值分布是否拉开差距
   double std_dev_threshold = ep_->sigma_threshold_;
+  //最大语义值/平均语义值的阈值，衡量最强热点是否足够突出
   double max_to_mean_threshold = ep_->max_to_mean_threshold_;
   vector<SemanticFrontier> sem_frontiers;
+  //给每个 frontier 算语义值，并排序
   getSortedSemanticFrontiers(cur_pos, frontiers, sem_frontiers);
   if (sem_frontiers.empty())
     return;
 
   double std_dev, max_to_mean, mean;
+  //统计frontier的标准差，最大值/平均值，平均值
   calcSemanticFrontierInfo(sem_frontiers, std_dev, max_to_mean, mean);
 
   // Decide between exploitation and exploration based on semantic statistics
   if (std_dev > std_dev_threshold && max_to_mean > max_to_mean_threshold) {
+    //语义足够突出
     ROS_WARN("Exploit the semantic value (TSP)!!");
     vector<Vector2d> high_sem_frontiers;
 
-    // Select high-value frontiers for TSP optimization
+    // Select high-value frontiers for TSP optimization  选出高语义frontier 动态调节高语义筛选比例
     for (auto sem_frontier : sem_frontiers) {
       double auto_max_to_mean_threshold =
           max(max_to_mean_threshold, ep_->max_to_mean_percentage_ * max_to_mean);
@@ -231,6 +247,7 @@ void ExplorationManager::hybridExplorePolicy(Vector2d cur_pos, vector<Vector2d> 
         break;
       high_sem_frontiers.push_back(sem_frontier.position);
     }
+    //先对一组 frontier 计算一个 TSP 访问顺序，再从这个顺序里选出当前应该先去的下一个 frontier。
     findTSPTourPolicy(cur_pos, high_sem_frontiers, next_best_pos, next_best_path);
   }
   else {
@@ -292,17 +309,19 @@ void ExplorationManager::findHighestSemanticsFrontierPolicy(Vector2d cur_pos,
     break;
   }
 }
-
+//在所有 frontier 里，找一个实际路径最短、最容易到达的 frontier。
+//输入起始位置，frontier中心点，输出下一个位置和路径
 void ExplorationManager::findClosestFrontierPolicy(Vector2d cur_pos, vector<Vector2d> frontiers,
     Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
 {
   next_best_path.clear();
 
   // Sort frontiers by Euclidean distance for efficient processing
+  //欧式距离排序做剪枝，最后根据真实a*路径长度选优
   std::sort(frontiers.begin(), frontiers.end(), [&cur_pos](const Vector2d& a, const Vector2d& b) {
     return (a - cur_pos).norm() < (b - cur_pos).norm();
   });
-
+  //初始化当前最短路径长度为无穷大
   double min_len = std::numeric_limits<double>::max();
 
   // Find the frontier with shortest actual path length
@@ -314,7 +333,7 @@ void ExplorationManager::findClosestFrontierPolicy(Vector2d cur_pos, vector<Vect
     std::vector<Eigen::Vector2d> tmp_path;
     Eigen::Vector2d tmp_pos;
 
-    // Attempt path planning to this frontier
+    // Attempt path planning to this frontier  不可达就跳过，可达就判断是否最短，更新数据
     if (!searchFrontierPath(cur_pos, frontiers[i], tmp_pos, tmp_path))
       continue;
 
@@ -332,7 +351,7 @@ void ExplorationManager::findTSPTourPolicy(Vector2d cur_pos, vector<Vector2d> fr
     Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
 {
   next_best_path.clear();
-  vector<Vector2d> filter_frontiers;
+  vector<Vector2d> filter_frontiers;  //滤除当前不可达frontier
   for (auto frontier : frontiers) {
     Vector2d tmp_pos;
     vector<Vector2d> tmp_path;
@@ -341,10 +360,13 @@ void ExplorationManager::findTSPTourPolicy(Vector2d cur_pos, vector<Vector2d> fr
   }
 
   vector<int> indices;
+  //对可达frontiers计算atsp顺序，返回一组索引indices，代表frontiers的访问顺序
   computeATSPTour(cur_pos, filter_frontiers, indices);
   ed_->tsp_tour_.push_back(cur_pos);
+  //atsp路线存进ed_，主要是为了可视化，本轮规划得到的 frontier 巡回顺序轨迹。
   for (auto idx : indices) ed_->tsp_tour_.push_back(filter_frontiers[idx]);
 
+  //选择地一个可达的frontier
   if (!indices.empty()) {
     for (auto idx : indices) {
       Vector2d next_bext_frontier = filter_frontiers[idx];
@@ -478,20 +500,23 @@ void ExplorationManager::computeATSPTour(
   double tsp_time = (ros::Time::now() - t1).toSec();
   ROS_WARN("[ATSP Tour] Cost mat: %lf, TSP: %lf", mat_time, tsp_time);
 }
-
+//在一个对象点云里，找出离机器人当前位置最近的那个点。
 Vector2d ExplorationManager::findNearestObjectPoint(
     const Vector3d& start, const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& object_cloud)
 {
+  // 建一个 KD-Tree
+//   KD-Tree 是一种用来做最近邻搜索的数据结构。
+// 这里就是为了高效找“最近点”。
   pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
   kdtree.setInputCloud(object_cloud);
   std::vector<int> pointIdxNKNSearch(1);
   std::vector<float> pointNKNSquaredDistance(1);
-
+  //把机器人当前位置转成 PCL 点格式。
   pcl::PointXYZ cur_pt;
   cur_pt.x = start(0);
   cur_pt.y = start(1);
   cur_pt.z = start(2);
-
+  //从对象点云里找离当前机器人最近的 1 个点。
   if (kdtree.nearestKSearch(cur_pt, 1, pointIdxNKNSearch, pointNKNSquaredDistance) <= 0) {
     ROS_ERROR("[Bug] No nearest object point found.");
     return Vector2d(-1000.0, -1000.0);  // Error indicator
@@ -508,13 +533,16 @@ bool ExplorationManager::trySearchObjectPathWithDistance(const Vector2d& start2d
     const std::string& debug_msg)
 {
   path_finder_->reset();
+  //证明可以靠近，但是这时路径终点仍然为onject_pose
   if (path_finder_->astarSearch(start2d, object_pose, distance, max_search_time) ==
       Astar2D::REACH_END) {
     std::vector<Eigen::Vector2d> path = path_finder_->getPath();
     Vector2d tmp_pos(-1000.0, -1000.0);
 
     // Find valid position along the path (from end to start)
+    //寻找实际可执行的安全点
     for (int i = path.size() - 1; i >= 0; i--) {
+      //path[i]：路径上的第 i 个二维路径点/waypoint
       if (sdf_map_->getOccupancy(path[i]) != SDFMap2D::OCCUPIED &&
           sdf_map_->getOccupancy(path[i]) != SDFMap2D::UNKNOWN &&
           sdf_map_->getInflateOccupancy(path[i]) != 1) {
@@ -536,15 +564,15 @@ bool ExplorationManager::trySearchObjectPathWithDistance(const Vector2d& start2d
   }
   return false;
 }
-
+//给定当前机器人位置和一个目标对象点云，尝试找一条能靠近该对象的 2D 路径。
 bool ExplorationManager::searchObjectPath(const Vector3d& start,
     const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& object_cloud,
     Eigen::Vector2d& refined_pos, std::vector<Eigen::Vector2d>& refined_path)
 {
   const double max_search_time = 0.2;  // Maximum planning time per attempt
-  Vector2d start2d = Vector2d(start(0), start(1));
+  Vector2d start2d = Vector2d(start(0), start(1));//把当前3d起点取成2d
 
-  // Find nearest accessible point in object cloud
+  // Find nearest accessible point in object cloud：从目标对象点云里找一个“最近且可接近”的对象位置
   Vector2d object_pose = findNearestObjectPoint(start, object_cloud);
   if (object_pose.x() < -999.0)
     return false;  // Error indicator from findNearestObjectPoint
@@ -553,7 +581,7 @@ bool ExplorationManager::searchObjectPath(const Vector3d& start,
   const std::vector<double> distances = { 0.5, 0.70, 0.85 };
   const std::vector<std::string> debug_messages = { "I'm going to the object! dist = 0.5m!",
     "I'm going to the object! dist = 0.70m!", "I'm going to the object! dist = 0.85m!" };
-
+  // 找去目标附近一个合适观察/接近点的路径。
   // Attempt path planning with each safety distance
   for (size_t i = 0; i < distances.size(); ++i) {
     if (trySearchObjectPathWithDistance(start2d, object_pose, distances[i], max_search_time,
@@ -565,27 +593,29 @@ bool ExplorationManager::searchObjectPath(const Vector3d& start,
   ROS_ERROR("Failed to find object path.");
   return false;
 }
-
+//给每个 frontier 计算“语义价值 + 可达路径”，然后把可达的 frontier 按优先级排好序。
 void ExplorationManager::getSortedSemanticFrontiers(const Vector2d& cur_pos,
     const vector<Vector2d>& frontiers, vector<SemanticFrontier>& sem_frontiers)
 {
   // Filter and sort frontiers based on semantic values and reachability
   sem_frontiers.clear();
-
+  //给每个 frontier 建一个 SemanticFrontier 结构（position,semantic_value,path_length,path）
   for (auto& frontier : frontiers) {
     SemanticFrontier sem_frontier;
     sem_frontier.position = frontier;
 
     // Compute semantic value from local neighborhood
+    //frontier算语义值（局部邻域最大语义值）
+    //idx:栅格地图里的二维索引
     Vector2i idx;
     sdf_map_->posToIndex(frontier, idx);
-    auto nbrs = allNeighbors(idx, 2);  // 5x5 grid neighborhood
+    auto nbrs = allNeighbors(idx, 2);  // 5x5 grid neighborhood 找以 idx 为中心，半径 2 格的邻居集合。
     double value = sdf_map_->value_map_->getValue(idx);
 
     // Find maximum semantic value in neighborhood (ignoring occupied cells)
     for (auto& nbr : nbrs) {
-      if (sdf_map_->getInflateOccupancy(idx) == 1 ||
-          sdf_map_->getOccupancy(idx) == SDFMap2D::OCCUPIED)
+      if (sdf_map_->getInflateOccupancy(nbr) == 1 ||
+          sdf_map_->getOccupancy(nbr) == SDFMap2D::OCCUPIED)
         continue;
       value = std::max(value, sdf_map_->value_map_->getValue(nbr));
     }
@@ -609,7 +639,8 @@ void ExplorationManager::getSortedSemanticFrontiers(const Vector2d& cur_pos,
       sem_frontiers.push_back(sem_frontier);
   }
 
-  // Sort by semantic value (desc) then by path length (asc)
+  // Sort by semantic value (desc) then by path length (asc),
+  //semantic_value 从高到低,path_length 从短到长 头文件中定义
   std::sort(sem_frontiers.begin(), sem_frontiers.end());
 }
 
@@ -653,7 +684,7 @@ void ExplorationManager::calcSemanticFrontierInfo(const vector<SemanticFrontier>
                 << std::endl;
   }
 }
-
+//把上层给出的起点状态和目标状态，变成一条真正连续可执行的局部轨迹。
 bool ExplorationManager::planTrajectory(
     const Eigen::VectorXd& start, const Eigen::VectorXd& end, const Vector3d& ctrl)
 {
@@ -667,15 +698,18 @@ bool ExplorationManager::planTrajectory(
   goal_state = end;
   current_state = start;
 
-  // Kinodynamic A* search
+  // Kinodynamic A* search 先找一条满足动力学约束的粗可行轨迹/初始轨迹。
   kinoastar_->reset();
   kinoastar_->search(goal_state, current_state, control);
+  //把 KinoAstar 已经搜到的结果整理成后端能用的轨迹表示
   kinoastar_->getKinoNode();
   
   if (kinoastar_->has_path_) {
     kinoastar_->kinoastarFlatPathPub(kinoastar_->flat_trajs_);
+    //轨迹优化：更平滑、更连续、满足约束的多项式轨迹
     gcopter_->minco_plan();
     std::vector<Trajectory<7, 3>> final_trajes = gcopter_->final_trajes;
+    //把已经算好的最终 MINCO/GCopter 轨迹发布成一条可在 RViz 里显示的路径
     gcopter_->mincoPathPub(gcopter_->final_trajes, gcopter_->final_singuls);
     return true;
   }

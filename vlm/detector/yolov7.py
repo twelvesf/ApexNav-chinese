@@ -1,3 +1,7 @@
+# YOLOv7：固定类别检测器，适合常见物体，快、直接
+# GroundingDINO：开放词汇检测器，适合更灵活的文本目标
+
+
 import sys
 from typing import List, Optional
 

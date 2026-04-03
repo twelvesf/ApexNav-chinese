@@ -360,14 +360,16 @@ void FrontierMap2D::computeFrontierInfo(Frontier2D& ftr)
   // Compute final centroid as mean position of all cluster cells
   ftr.average_ /= double(ftr.cells_.size());
 }
-
+//检查当前已有的 frontier / dormant frontier 里，有没有哪一块因为地图更新而发生了“足够明显”的变化
 bool FrontierMap2D::isAnyFrontierChanged()
 {
   // Get spatial bounds of recently updated map regions
   Vector2d update_min, update_max;
+  //拿到最近地图更新区域
   sdf_map_->getLocalUpdatedBox(update_min, update_max);
 
   // Lambda function for frontier change evaluation with threshold-based detection
+  //临时匿名函数 赋值给了checkchanges
   auto checkChanges = [&](const list<Frontier2D>& frontiers) {
     for (auto ftr : frontiers) {
       // Skip frontiers outside updated region to optimize computation
@@ -375,6 +377,7 @@ bool FrontierMap2D::isAnyFrontierChanged()
         continue;
 
       // Calculate change threshold based on frontier size and configuration
+      //用阈值判断是不是“变化明显”
       const int change_thresh = min_view_finish_fraction_ * ftr.cells_.size();
       int change_num = 0;
 
@@ -384,6 +387,7 @@ bool FrontierMap2D::isAnyFrontierChanged()
         sdf_map_->posToIndex(cell, idx);
 
         // Increment counter and check threshold for early termination
+        //统计这个 frontier 有多少 cell 已经“不再像 frontier”
         if (!isSatisfyFrontier(idx) && ++change_num >= change_thresh)
           return true;  // Significant changes detected
       }

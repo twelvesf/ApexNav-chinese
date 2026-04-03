@@ -105,7 +105,9 @@ struct FSMParam {
   std::vector<Eigen::Vector2d> action_steps_;
   // replan timing parameters (loaded from ros params in ExplorationFSM::init)
   double replan_time_;
+  //当前轨迹还剩多久结束时就提前触发下一次重规划阈值
   double replan_traj_end_threshold_;
+  //轨迹开始执行后，至少过多久，frontier 变化才允许触发重规划  frontier 变化触发重规划”的最小延迟时间
   double replan_frontier_change_delay_;
   double replan_timeout_;
 };
@@ -124,6 +126,11 @@ struct ExplorationData {
     next_best_path_.clear();
     tsp_tour_.clear();
   }
+
+// frontiers_
+// 存的是每个 frontier 的完整点集/cluster
+// frontier_averages_
+// 存的是每个 frontier 对应的平均位置、代表位置、中心点
   std::vector<std::vector<Eigen::Vector2d>> frontiers_, dormant_frontiers_;
   std::vector<Eigen::Vector2d> frontier_averages_, dormant_frontier_averages_;
   std::vector<std::vector<Eigen::Vector2d>> objects_;

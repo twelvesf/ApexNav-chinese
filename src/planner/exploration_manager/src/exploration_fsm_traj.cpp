@@ -27,7 +27,7 @@ void ExplorationFSMReal::init(ros::NodeHandle& nh)
   nh.param("fsm/replan_frontier_change_delay", fp_->replan_frontier_change_delay_, 0.5);
   nh.param("fsm/replan_timeout", fp_->replan_timeout_, 2.0);
 
-  /* ROS Timer */
+  /* ROS Timer 在.h文件中设置*/
   exec_timer_ = nh.createTimer(
       ros::Duration(FSMConstantsReal::EXEC_TIMER_DURATION), &ExplorationFSMReal::FSMCallback, this);
   frontier_timer_ = nh.createTimer(ros::Duration(FSMConstantsReal::FRONTIER_TIMER_DURATION),
@@ -35,20 +35,30 @@ void ExplorationFSMReal::init(ros::NodeHandle& nh)
   safety_timer_ = nh.createTimer(ros::Duration(0.05), &ExplorationFSMReal::safetyCallback, this);
 
   /* ROS Subscriber */
+  // 触发
   trigger_sub_ =
       nh.subscribe("/move_base_simple/goal", 10, &ExplorationFSMReal::triggerCallback, this);
+  // 基本用不上，用于手动给一个点，然后非过去
   goal_sub_ = nh.subscribe("/initialpose", 10, &ExplorationFSMReal::goalCallback, this);
+  // 订阅里程计
   odom_sub_ = nh.subscribe("/odom_world", 10, &ExplorationFSMReal::odometryCallback, this);
+  // 订阅检测置信度阈值
   confidence_threshold_sub_ = nh.subscribe(
       "/detector/confidence_threshold", 10, &ExplorationFSMReal::confidenceThresholdCallback, this);
 
   /* ROS Publisher */
+  // /ros/state：FSM 当前阶段
+  // /ros/expl_state：这版里没真正用
+  // /ros/expl_result：当前规划结果类别
+  // /robot：机器人可视化 marker
   ros_state_pub_ = nh.advertise<std_msgs::Int32>("/ros/state", 10);
   expl_state_pub_ = nh.advertise<std_msgs::Int32>("/ros/expl_state", 10);
   expl_result_pub_ = nh.advertise<std_msgs::Int32>("/ros/expl_result", 10);
   robot_marker_pub_ = nh.advertise<visualization_msgs::Marker>("/robot", 10);
 
   // Real-world trajectory publishers
+  // 发布轨迹信息
+  // 发布stop命令
   poly_traj_pub_ = nh.advertise<trajectory_manager::PolyTraj>("/planning/trajectory", 10);
   stop_pub_ = nh.advertise<std_msgs::Empty>("/traj_server/stop", 10);
 
@@ -113,15 +123,23 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
         Eigen::Vector3d cur_pos = info->traj.getPos(t_plan);
         Eigen::Vector3d cur_vel = info->traj.getVel(t_plan);
         Eigen::Vector3d cur_acc = info->traj.getAcc(t_plan);
+        //通过速度反推当前航向角
+        //yaw=atan2(vy,vx)
         double cur_yaw = atan2(cur_vel(1), cur_vel(0));
 
         // Calculate yaw rate from acceleration
         Eigen::Matrix2d B_h;
         B_h << 0, -1.0, 1.0, 0;
+        //B_h矩阵作用是把一个2d向量旋转90度，[vx, vy] 变成 [-vy, vx]
+        //cur_vel_2d = [vx, vy]
+        // cur_acc_2d = [ax, ay]
         Eigen::Vector2d cur_vel_2d = cur_vel.head(2);
         Eigen::Vector2d cur_acc_2d = cur_acc.head(2);
+        //norm_vel=|v|= sqrt(vx^2 + vy^2)
         double norm_vel = cur_vel_2d.norm();
+        //1 / (vx^2 + vy^2 + 1e-2) ，1e-2 是为了防止速度太小时分母接近 0，避免数值爆炸
         double help1 = 1.0 / (norm_vel * norm_vel + 1e-2);
+        //omega = (vx * ay - vy * ax) / (vx^2 + vy^2 + 1e-2)    其实就是cur_yaw=atan2(vy,vx)的导数
         double omega = help1 * cur_acc_2d.transpose() * B_h * cur_vel_2d;
 
         fd_->start_pt_ = cur_pos;
@@ -130,6 +148,7 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
         fd_->start_yaw_(1) = omega;
       }
 
+      //根据当前机器人状态和当前探索结果，选出下一个局部目标，并真正生成一条可执行轨迹。
       TrajPlannerResult res = callTrajectoryPlanner();
 
       if (res == TrajPlannerResult::FAILED) {
@@ -142,11 +161,11 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
       else {  // TrajPlannerResult::MISSION_COMPLETE
         transitState(RealFSM::State::FINISH, "FSM");
       }
-
+      //可视化
       visualize();
       break;
     }
-
+    //发布规划好的轨迹
     case RealFSM::State::EXEC_TRAJ: {
       // Publish trajectory and transition to execution monitoring
       double dt = (ros::Time::now() - fd_->newest_traj_.start_time).toSec();
@@ -167,6 +186,7 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
       double time_to_end = info->duration - t_cur;
 
       // Replan if trajectory is almost finished
+      //当前轨迹还剩多久结束时就提前触发下一次重规划
       if (time_to_end < fp_->replan_traj_end_threshold_) {
         transitState(RealFSM::State::PLAN_TRAJ, "FSM");
         ROS_WARN("[Real] Replan: traj fully executed");
@@ -176,7 +196,7 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
 
       // Replan if frontier changed during exploration
       if (t_cur > fp_->replan_frontier_change_delay_ &&
-          fd_->final_result_ == FINAL_RESULT::EXPLORE &&
+          fd_->final_result_ == FINAL_RESULT::EXPLORE &&    //处于几何探索阶段 frotiner改变
           expl_manager_->frontier_map2d_->isAnyFrontierChanged()) {
         transitState(RealFSM::State::PLAN_TRAJ, "FSM");
         ROS_WARN("[Real] Replan: frontier changed");
@@ -184,7 +204,7 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
         return;
       }
 
-      // Replan if trajectory timeout
+      // Replan if trajectory timeout //超时
       if (t_cur > fp_->replan_timeout_) {
         transitState(RealFSM::State::PLAN_TRAJ, "FSM");
         ROS_WARN("[Real] Replan: time out");
@@ -198,21 +218,26 @@ void ExplorationFSMReal::FSMCallback(const ros::TimerEvent& e)
   exec_timer_.start();
 }
 
+//根据当前机器人状态和当前探索结果，选出下一个局部目标，并真正生成一条可执行轨迹。
 TrajPlannerResult ExplorationFSMReal::callTrajectoryPlanner()
 {
   ros::Time time_r = ros::Time::now() + ros::Duration(fp_->replan_time_);
+  //更新frontier
   updateFrontierAndObject();
 
-  // Call exploration manager to find next best point
+  // Call exploration manager to find next best point //决定下一步应该去追哪个目标，以及给出一条 2D 粗路径。
+  //传的是规划是否成功的状态
   int expl_res = expl_manager_->planNextBestPoint(fd_->start_pt_, fd_->start_yaw_(0));
 
   // Determine final result based on exploration result
+  //几何探索
   if (expl_res == EXPL_RESULT::EXPLORATION)
     fd_->final_result_ = FINAL_RESULT::EXPLORE;
   else if (expl_res == EXPL_RESULT::NO_COVERABLE_FRONTIER ||
            expl_res == EXPL_RESULT::NO_PASSABLE_FRONTIER)
     fd_->final_result_ = FINAL_RESULT::NO_FRONTIER;
   else
+  //语义搜索
     fd_->final_result_ = FINAL_RESULT::SEARCH_OBJECT;
 
   // Publish exploration result
@@ -229,6 +254,7 @@ TrajPlannerResult ExplorationFSMReal::callTrajectoryPlanner()
   Eigen::Vector2d goal_pos = expl_manager_->ed_->next_pos_;
   double goal_yaw = 0.0;
   auto path = expl_manager_->ed_->next_best_path_;
+  // 根据当前位置和全局路径，选取局部目标点及朝向
   selectLocalTarget(fd_->start_pt_.head(2), path, 4.0, goal_pos, goal_yaw);
 
   // Check if reached object
@@ -241,15 +267,21 @@ TrajPlannerResult ExplorationFSMReal::callTrajectoryPlanner()
   // Prepare state for trajectory planning
   Eigen::VectorXd goal_state(5), current_state(5);
   Eigen::Vector3d current_control(0.0, 0.0, 0.0);
+  //速度标量大小
   double start_vel = Eigen::Vector2d(fd_->start_vel_(0), fd_->start_vel_(1)).norm();
   current_state << fd_->start_pt_(0), fd_->start_pt_(1), fd_->start_yaw_(0), 0.0, start_vel;
   goal_state << goal_pos(0), goal_pos(1), goal_yaw, 0.0, 0.0;
 
   // Plan trajectory using GCopter
+  //开始真正做轨迹规划。
   bool traj_res = expl_manager_->planTrajectory(current_state, goal_state, current_control);
   if (traj_res) {
+    //拿到的是 GCopter 里保存的那条最新局部轨迹
     auto info = &expl_manager_->gcopter_->local_trajectory_;
+    //给这条轨迹确定一个实际生效的起始时间。
     info->start_time = (ros::Time::now() - time_r).toSec() > 0 ? ros::Time::now() : time_r;
+    //把本轮规划结果正式交给 FSM 保存。
+    //fd_ 里主要存 FSM 当前执行状态以及最新的局部连续轨迹
     fd_->newest_traj_ = expl_manager_->gcopter_->local_trajectory_;
     return TrajPlannerResult::SUCCESS;
   }
@@ -285,12 +317,16 @@ void ExplorationFSMReal::polyTraj2ROSMsg(
     }
   }
 }
-
+//把全局粗路径转换成一个当前可执行、朝向合理、并且更安全的局部跟踪目标。
+//结果存到：expl_manager_->ed_->next_local_pos_
+//用 ESDF 距离场做一个局部避障修正：如果局部目标点太贴近障碍，就沿“离障碍更远”的方向把它推开一点。
 void ExplorationFSMReal::selectLocalTarget(const Eigen::Vector2d& current_pos,
     const std::vector<Eigen::Vector2d>& path, const double& local_distance,
     Eigen::Vector2d& target_pos, double& target_yaw)
 {
   // First, try to find a collision-free target from the end of path
+  //从路径尾部往前扫，找一个在给定朝向下不会碰撞的位置，作为初始target_pos
+  //这里的朝向是从该点看向路径终点的方向
   for (int i = path.size() - 2; i >= 0; i--) {
     target_yaw = atan2(path.back()(1) - path[i](1), path.back()(0) - path[i](0));
     if (!expl_manager_->kinoastar_->isCollisionPosYaw(path[i], target_yaw)) {
@@ -300,6 +336,7 @@ void ExplorationFSMReal::selectLocalTarget(const Eigen::Vector2d& current_pos,
   }
 
   // Find closest path point to current position
+  //找到机器人在全局路径的位置
   int start_path_id = 0;
   double min_dist = std::numeric_limits<double>::max();
   for (int i = 0; i < (int)path.size() - 1; i++) {
@@ -311,6 +348,7 @@ void ExplorationFSMReal::selectLocalTarget(const Eigen::Vector2d& current_pos,
   }
 
   // Select local target within local_distance
+  //按照local_distance选一个局部前视目标点，全局路径 -> 当前只跟踪前方一小段
   double len = (path[start_path_id] - current_pos).norm();
   for (int i = start_path_id + 1; i < (int)path.size(); i++) {
     len += (path[i] - path[i - 1]).norm();
@@ -322,6 +360,9 @@ void ExplorationFSMReal::selectLocalTarget(const Eigen::Vector2d& current_pos,
   }
 
   // Gradient-based safety adjustment
+//   每次最多挪 0.05m
+// 挪动太小就认为收敛
+// 最多迭代 30 次
   double step_size = 0.05;
   double tolerance = 1e-3;
   int max_iterations = 30;
@@ -331,17 +372,21 @@ void ExplorationFSMReal::selectLocalTarget(const Eigen::Vector2d& current_pos,
 
     // Get gradient from SDF map
     Eigen::Vector2d grad;
+    //查询当前点的障碍距离和梯度，disk：当前target_pos离最近障碍的距离，grad：离障碍更远的方向
     double dist = expl_manager_->sdf_map_->getDistWithGrad(target_pos, grad);
 
     if (dist > 0.26)
       break;
 
     // Move along gradient to safer position
+    //朝更空旷、更远离障碍的方向小步移动。
     if (grad.norm() > 1e-6) {
+      //grad.normalized:把向量 grad 归一化成单位向量。方向不变，长度为1
       target_pos += step_size * grad.normalized();
     }
 
     // Check convergence
+    //位置变化很小，认为收敛
     if ((target_pos - prev_pos).norm() < tolerance) {
       break;
     }
@@ -350,7 +395,8 @@ void ExplorationFSMReal::selectLocalTarget(const Eigen::Vector2d& current_pos,
   // Store selected local target
   expl_manager_->ed_->next_local_pos_ = target_pos;
 }
-
+//当前 frontier、dormant frontier、object、下一条粗路径、
+//局部目标点和 TSP 巡回路线全部发布成 RViz 可视化标记
 void ExplorationFSMReal::visualize()
 {
   auto ed_ptr = expl_manager_->ed_;
@@ -409,7 +455,7 @@ void ExplorationFSMReal::visualize()
   visualization_->drawLines(vec2dTo3d(ed_ptr->tsp_tour_), fp_->vis_scale_ / 1.25,
       Eigen::Vector4d(0.2, 1, 0.2, 1), "tsp_tour", 0, 6);
 }
-
+//发布空 marker，把 RViz 里之前画出来的 frontier / object / path 可视化全部清掉
 void ExplorationFSMReal::clearVisMarker()
 {
   for (int i = 0; i < 500; ++i) {
@@ -420,18 +466,24 @@ void ExplorationFSMReal::clearVisMarker()
   }
   visualization_->drawLines({}, fp_->vis_scale_, Eigen::Vector4d(0, 0, 1, 1), "next_path", 1, 6);
 }
+// 状态同步/刷新函数：
 
+// 把当前地图里的 frontier 和 object 信息，重新整理到 ExplorationData ed_ 里，供后面的规划和可视化使用。
 bool ExplorationFSMReal::updateFrontierAndObject()
 {
   bool change_flag = false;
   auto frt_map = expl_manager_->frontier_map2d_;
   auto obj_map = expl_manager_->object_map2d_;
+  //智能指针
   auto ed = expl_manager_->ed_;
   Eigen::Vector2d sensor_pos = Eigen::Vector2d(fd_->odom_pos_(0), fd_->odom_pos_(1));
-
+// 检查“已有 frontier 是否因为地图更新而失效/变化”
   change_flag = frt_map->isAnyFrontierChanged();
+  // 重建 active frontier 列表。
   frt_map->searchFrontiers();
+  // 把不值得继续作为主探索目标的 frontier 暂时降级。
   change_flag |= frt_map->dormantSeenFrontiers(sensor_pos, fd_->odom_yaw_);
+  //拷贝到ed
   frt_map->getFrontiers(ed->frontiers_, ed->frontier_averages_);
   frt_map->getDormantFrontiers(ed->dormant_frontiers_, ed->dormant_frontier_averages_);
   obj_map->getObjects(ed->objects_, ed->object_averages_, ed->object_labels_);
@@ -486,9 +538,10 @@ void ExplorationFSMReal::odometryCallback(const nav_msgs::OdometryConstPtr& msg)
   fd_->have_odom_ = true;
 
   // Publish robot marker for visualization
+  //在 RViz 里把机器人当前位置和朝向画出来。
   publishRobotMarker();
 }
-
+//从外部话题 /detector/confidence_threshold 接收一次“目标置信度阈值”，并把它写进 ObjectMap2D
 void ExplorationFSMReal::confidenceThresholdCallback(const std_msgs::Float64ConstPtr& msg)
 {
   if (fd_->have_confidence_)
@@ -498,6 +551,7 @@ void ExplorationFSMReal::confidenceThresholdCallback(const std_msgs::Float64Cons
   ROS_INFO("[Real] Confidence threshold set to: %.2f", msg->data);
 }
 
+//无关，给一个点导航
 void ExplorationFSMReal::goalCallback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& msg)
 {
   double x = msg->pose.pose.position.x;
@@ -523,12 +577,14 @@ void ExplorationFSMReal::goalCallback(const geometry_msgs::PoseWithCovarianceSta
   ROS_INFO("[Real] Received goal pose: x=%.2f, y=%.2f, yaw=%.2f", x, y, yaw);
 }
 
+//紧急停车
+//发布stop信息给traj_server
 void ExplorationFSMReal::emergencyStop()
 {
   fd_->static_state_ = true;
   stop_pub_.publish(std_msgs::Empty());
 }
-
+//在机器人执行轨迹期间，持续做安全监控；一旦发现偏离轨迹太多或者前方轨迹会撞障碍，就紧急停车并重新规划。
 void ExplorationFSMReal::safetyCallback(const ros::TimerEvent& e)
 {
   if (state_ != RealFSM::State::REPLAN)
@@ -549,7 +605,8 @@ void ExplorationFSMReal::safetyCallback(const ros::TimerEvent& e)
   // Time-sampled safety check - use inflated map to detect obstacles
   double time_horizon = 2.5;  // Check trajectory for next 2.5 seconds
   double sample_dt = 0.1;     // Sample every 0.1 seconds
-
+//检查未来一小段轨迹上是否会碰到障碍
+//这里会对未来 2.5s 的轨迹做采样检查，每 0.1s 看一个点。
   for (double t_check = t_cur;
       t_check <= min(t_cur + time_horizon, expl_manager_->gcopter_->local_trajectory_.duration);
       t_check += sample_dt) {
@@ -569,7 +626,7 @@ void ExplorationFSMReal::safetyCallback(const ros::TimerEvent& e)
     }
   }
 }
-
+//在 RViz 里把机器人当前位置和朝向画出来。
 void ExplorationFSMReal::publishRobotMarker()
 {
   const double robot_height = FSMConstantsReal::ROBOT_HEIGHT;

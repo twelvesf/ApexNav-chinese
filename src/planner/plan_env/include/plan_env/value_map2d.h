@@ -70,6 +70,7 @@ inline double ValueMap::getValue(const Vector2d& pos)
 
 inline double ValueMap::getValue(const Vector2i& idx)
 {
+  //二维坐标映射成1维
   int adr = sdf_map_->toAddress(idx);
   return value_buffer_[adr];
 }

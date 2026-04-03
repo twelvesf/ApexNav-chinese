@@ -1,3 +1,6 @@
+# BLIP2：视觉语言模型   图像文本匹配打分器
+# Client-Server工程封装
+# 语义价值
 from typing import Any, Optional
 
 import numpy as np
@@ -34,6 +37,7 @@ class BLIP2ITM:
         )
         self.device = device
 
+    #计算图像和文本的cosine相似度
     def cosine(self, image: np.ndarray, txt: str) -> float:
         """
         Compute the cosine similarity between the image and the prompt.
@@ -54,6 +58,7 @@ class BLIP2ITM:
             ).item()
         return cosine
 
+    #计算更明确的image-text matching分数
     def itm_scores(self, image: np.ndarray, txt: str) -> np.ndarray:
         pil_img = Image.fromarray(image)
         img = self.vis_processors["eval"](pil_img).unsqueeze(0).to(self.device)
@@ -65,6 +70,8 @@ class BLIP2ITM:
         itm_score = itm_scores[:, 1].item()
         return itm_score
 
+# cosine：适合“前方整体看起来像不像目标相关区域”
+# itm_score：适合“这个候选框到底是不是目标”
 
 class BLIP2ITMClient:
     def __init__(self, port: int = 12182):

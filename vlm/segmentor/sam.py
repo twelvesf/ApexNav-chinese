@@ -1,3 +1,6 @@
+# 输入groundingdino传来的框，输出分割mask  mobilesam：扣出框内的目标像素
+# mask : 与图像同尺寸的二值区域图，用来表示哪些图像属于目标哪些不属于
+
 import os
 from typing import Any, List, Optional
 
@@ -35,6 +38,7 @@ class MobileSAM:
         mobile_sam.eval()
         self.predictor = SamPredictor(mobile_sam)
 
+#输入图像和框 [x1, y1, x2, y2]，输出布尔 mask
     def segment_bbox(self, image: np.ndarray, bbox: List[int]) -> np.ndarray:
         """Segments the object in the given bounding box from the image.
 

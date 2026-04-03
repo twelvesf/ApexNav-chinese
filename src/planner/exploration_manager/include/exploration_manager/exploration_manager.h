@@ -150,12 +150,14 @@ inline bool ExplorationManager::searchObjectPathExtreme(const Vector3d& start,
     const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& object_cloud,
     Eigen::Vector2d& refined_pos, std::vector<Eigen::Vector2d>& refined_path)
 {
+  //寻找最近目标点
   Vector2d object_pose = findNearestObjectPoint(start, object_cloud);
   if (object_pose.x() < -999.0)
     return false;  // Error finding nearest point
-
+  //转2d
   Vector2d start2d = Vector2d(start(0), start(1));
   path_finder_->reset();
+  //极端a*搜索
   if (path_finder_->astarSearch(start2d, object_pose, 0.25, 0.2, Astar2D::SAFETY_MODE::EXTREME) ==
       Astar2D::REACH_END) {
     refined_pos = object_pose;

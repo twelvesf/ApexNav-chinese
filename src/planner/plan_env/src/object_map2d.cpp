@@ -532,13 +532,22 @@ void ObjectMap2D::getAllConfidenceObjectClouds(
     }
   }
 }
-
+// ObjectMap2D里的所有对象簇
+// -> 按置信度筛选/排序
+// -> 转成若干个 object cloud
+// -> 给 ExplorationManager 用
+// 回的点云不是原始 3D 检测点云，而是把对象簇里的 2D 栅格单元 good_cells_ 或 cells_ 转成了 z=0 的点云
 void ObjectMap2D::getTopConfidenceObjectCloud(
     vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>>& top_object_clouds,
     bool limited_confidence, bool extreme)
 {
   top_object_clouds.clear();
   vector<ObjectCluster> top_objects;
+
+
+//   严格模式：基本只出“高置信目标对象”
+// 非严格模式：会更宽松，但仍然偏向“对目标标签 0 还有点希望的对象”
+// 极端模式 extreme=true：如果前面还是什么都没有，才会把所有对象的 cells_ 都并进来做最后兜底，包括相近目标对象
 
   // Confidence filtering strategy
   // TODO: May need logic adjustment for relaxed no limited_confidence conditions
@@ -571,6 +580,7 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
     }
 
     // Fallback for extreme mode when no high-confidence objects exist
+    // 直接把所有对象的全部 cells_ 都并到一个大点云里
     if (extreme && top_object_clouds.empty()) {
       pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> others_object_cloud;
       others_object_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
@@ -590,6 +600,13 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
   }
   else {
     // Apply confidence filtering with functional scoring
+//     对每个对象簇：
+
+// 遍历所有 label
+// 计算一个功能分数：
+// func_score = observation_cloud_sums_[label] * confidence_scores_[label]
+// 找出最佳 label best_label
+// 当前最像主目标、而且足够可信的对象。
     for (auto object : objects_) {
       int max_func_score = 0, best_label = -1;
 
@@ -610,12 +627,14 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
     }
 
     // Sort filtered objects by confidence
+    // 按 confidence_scores_[0] 从高到低排序
     std::sort(
         top_objects.begin(), top_objects.end(), [](const ObjectCluster& a, const ObjectCluster& b) {
           return a.confidence_scores_[0] > b.confidence_scores_[0];
         });
 
     // Extract point clouds from filtered objects
+    // 每个对象簇的 good_cells_ 转成点云塞进 top_object_clouds
     for (auto top_obj : top_objects) {
       pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> top_object_cloud;
       top_object_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
@@ -631,6 +650,11 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
   }
 }
 
+// 判断这个对象簇是不是“稳定且可信的目标对象”。
+// obj.confidence_scores_[0] >= min_confidence_
+// 目标标签 0 的置信度要足够高
+// obj.observation_nums_[0] >= min_observation_num_
+// 这个目标不能只被偶然看到一次，必须被观测到足够多次
 bool ObjectMap2D::isConfidenceObject(const ObjectCluster& obj)
 {
   if (obj.confidence_scores_[0] >= min_confidence_ &&
