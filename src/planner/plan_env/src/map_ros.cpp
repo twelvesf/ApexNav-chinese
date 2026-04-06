@@ -17,9 +17,15 @@ void MapROS::setMap(SDFMap2D* map)
 {
   this->map_ = map;
 }
-
+//把地图更新所需的 ROS 输入输出、缓存、定时器和同步器全部搭起来
+// 真正的地图更新动作:
+// depthPoseCallback()
+// detectedObjectCloudCallback()
+// itmScoreCallback()
+// updateESDFCallback()
 void MapROS::init()
 {
+  //读参数
   // Load camera intrinsic parameters from ROS parameter server
   node_.param("map_ros/fx", fx_, -1.0);
   node_.param("map_ros/fy", fy_, -1.0);
@@ -41,6 +47,7 @@ void MapROS::init()
   bool is_real_world;
   node_.param("is_real_world", is_real_world, false);
 
+  //在仿真环境中直接使用仿真器深度传感器配置覆盖普通配置
   if (!is_real_world) {
     // Override depth parameters with Habitat simulator settings
     double habitat_max_depth, habitat_min_depth;
@@ -56,25 +63,29 @@ void MapROS::init()
     }
   }
 
+  //初始化内部数据结构
   // Initialize point cloud data structures
-  depth_cloud_.reset(new PointCloud3D());
-  filtered_depth_cloud2d_.reset(new PointCloud2D());
+  depth_cloud_.reset(new PointCloud3D()); //原始3d点云
+  filtered_depth_cloud2d_.reset(new PointCloud2D());//过滤后的2d点云
 
-  // Pre-allocate point cloud vectors for efficiency
-  proj_points_.resize(640 * 480 / (skip_pixel_ * skip_pixel_));
+  // Pre-allocate point cloud vectors for efficiency  
+  proj_points_.resize(640 * 480 / (skip_pixel_ * skip_pixel_));//投影点缓存
   depth_cloud_->points.resize(640 * 480 / (skip_pixel_ * skip_pixel_));
   proj_points_cnt_ = 0;
-  depth_image_.reset(new cv::Mat);
+  depth_image_.reset(new cv::Mat); //深度图缓存
 
   // Initialize state flags
-  local_updated_ = false;
-  esdf_need_update_ = false;
+  local_updated_ = false; //局部地图刷新标志
+  esdf_need_update_ = false;  //是否需要刷新esdf
 
   // Setup periodic timers for map updates and visualization
+  //周期性更新esdf
   esdf_timer_ = node_.createTimer(ros::Duration(0.1), &MapROS::updateESDFCallback, this);
+  //周期性发布地图可视化
   vis_timer_ = node_.createTimer(ros::Duration(0.25), &MapROS::visCallback, this);
 
-  // Setup publishers for map visualization
+  // Setup publishers for map visualization 
+  //发布各种地图状态 用于可视化 调试查看等
   occupied_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupied", 10);
   unknown_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/unknown", 10);
   free_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/free", 10);
@@ -97,11 +108,13 @@ void MapROS::init()
   confidence_map_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/confidence_map", 10);
 
   // Setup subscribers for object detection and ITM scores
+  //直接订阅目标对象点云  图文匹配语义分数
   detected_object_cloud_sub_ = node_.subscribe(
       "/detector/clouds_with_scores", 10, &MapROS::detectedObjectCloudCallback, this);
   itm_score_sub_ = node_.subscribe("/blip2/cosine_score", 10, &MapROS::itmScoreCallback, this);
 
   // Setup synchronized subscribers for depth image and pose data
+  //同步订阅 深度图+位姿同步后才会触发occupancy / free grids / ValueMap 更新
   depth_sub_.reset(
       new message_filters::Subscriber<sensor_msgs::Image>(node_, "/map_ros/depth", 20));
   pose_sub_.reset(new message_filters::Subscriber<nav_msgs::Odometry>(node_, "/map_ros/pose", 20));
@@ -111,10 +124,10 @@ void MapROS::init()
   sync_image_pose_->setMaxIntervalDuration(ros::Duration(0.01));  // Set maximum temporal offset
   sync_image_pose_->registerCallback(boost::bind(&MapROS::depthPoseCallback, this, _1, _2));
 
-  // Initialize object tracking variables
-  continue_over_depth_count_ = -1;
-  itm_score_ = -1.0;
-  map_start_time_ = ros::Time::now();
+  // Initialize object tracking variables初始化对象跟踪和ITM状态
+  continue_over_depth_count_ = -1;  //over-depth object 维护计数
+  itm_score_ = -1.0;        //当前缓存的itm_score
+  map_start_time_ = ros::Time::now(); //地图启动时间
 }
 
 void MapROS::visCallback(const ros::TimerEvent& e)
@@ -139,10 +152,13 @@ void MapROS::itmScoreCallback(const std_msgs::Float64ConstPtr& msg)
 {
   itm_score_ = msg->data;
 }
-
+//ApexNav 对象语义层的主入口：它把前端检测结果转成稳定、可融合的对象点云，
+//并更新 ObjectMap2D，同时保留远距离不可靠但可能重要的目标候选。
+// 接收前端发来的“检测目标点云 + 分数 + 标签”，清洗过滤后更新 ObjectMap2D，
+//并额外维护一份远距离不可靠目标的 over_depth_object_cloud_
 void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfidenceConstPtr& msg)
 {
-  // Validate message structure consistency
+  // Validate message structure consistency 检查消息格式是否一致
   if (!(msg->confidence_scores.size() == msg->point_clouds.size() &&
           msg->confidence_scores.size() == msg->label_indices.size())) {
     ROS_ERROR("[Bug] The MultipleMasksWithConfidence msg is wrong!!!");
@@ -151,47 +167,58 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
 
   auto t1 = ros::Time::now();
 
+  //检查当前相机是不是朝下看 只有相机俯视得比较明显时，才处理对象点云。
   // Check camera orientation - only process when looking down (for better object detection)
   Eigen::Vector3d euler =
       camera_q_.toRotationMatrix().eulerAngles(2, 1, 0);  // ZYX order: yaw, roll, pitch
   if (euler[2] < 0)
     euler[2] += M_PI;
   double camera_pitch = euler[2];
-  if (camera_pitch < 1.5)  // Skip if camera not tilted down enough
+
+  if (camera_pitch < 1.5)  // Skip if camera not tilted down enough 
     return;
 
   // Backup previous over-depth object cloud for consistency tracking
+  //  备份旧的 over-depth cloud，然后清空当前缓存
   auto last_over_depth_cloud =
       std::make_shared<PointCloud3D>(*map_->object_map2d_->over_depth_object_cloud_);
   map_->object_map2d_->over_depth_object_cloud_.reset(new PointCloud3D());
 
+  //准备这一轮的容器
   // Initialize point cloud processing tools and containers
   pcl::VoxelGrid<Point3D> voxel_filter;
-  PointCloud3D::Ptr all_object_cloud(new PointCloud3D());
-  PointCloud3D::Ptr filtered_all_object_cloud(new PointCloud3D());
-  vector<DetectedObject> detected_objects;
+  PointCloud3D::Ptr all_object_cloud(new PointCloud3D()); //所有原始对象点云直接拼起来，主要用于可视化
+  PointCloud3D::Ptr filtered_all_object_cloud(new PointCloud3D());//经过清洗后的对象点云拼接结果
+  vector<DetectedObject> detected_objects;//最终准备送进 inputObjectCloud2D() 的结构化对象列表
 
-  // Process each detected object in the message
+  // Process each detected object in the message  逐步处理每个检测到的对象
   for (int i = 0; i < (int)msg->confidence_scores.size(); i++) {
+    //取出这个对象的三件套
     auto cloud = msg->point_clouds[i];
     auto confidence_score = msg->confidence_scores[i];
     auto label = msg->label_indices[i];
 
-    // Convert ROS message to PCL point cloud
+    // Convert ROS message to PCL point cloud  fromROSMsg 转成 PCL 点云
+    // single_object_cloud：当前这个目标自己的点云
+    // all_object_cloud：这一帧所有目标的原始总点云
     PointCloud3D::Ptr single_object_cloud(new PointCloud3D());
     pcl::fromROSMsg(cloud, *single_object_cloud);
     *all_object_cloud += *single_object_cloud;
 
-    // Apply voxel grid downsampling to reduce computational load
-    voxel_filter.setInputCloud(single_object_cloud);
+    // Apply voxel grid downsampling to reduce computational load  
+    //对当前目标做体素VoxelGrid 下采样
+    // 减少点数 降低dbscan和对象融合的开销 让点云更规整
+    voxel_filter.setInputCloud(single_object_cloud); 
     voxel_filter.setLeafSize(0.04f, 0.04f, 0.06f);
     voxel_filter.filter(*single_object_cloud);
 
-    // Filter out points beyond sensor accuracy range (>5m depth is unreliable)
+    // Filter out points beyond sensor accuracy range (>5m depth is unreliable) 
+    //按深度范围过滤
     PointCloud3D::Ptr tmp_object_cloud(new PointCloud3D());
     PointCloud3D::Ptr over_depth_object_cloud(new PointCloud3D());
     for (auto object_pt : single_object_cloud->points) {
       Eigen::Vector3d object_pt3d = Eigen::Vector3d(object_pt.x, object_pt.y, object_pt.z);
+      //深度过滤 点太远就认为深度不可靠 对普通点丢掉,对label==0的主目标点 保留到over_depth_object_cloud_
       if ((object_pt3d - camera_pos_).norm() > depth_filter_maxdist_ - 0.10) {
         // Store over-depth points for target objects (label == 0) for tracking consistency
         if (label == 0)
@@ -203,6 +230,7 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
     single_object_cloud = tmp_object_cloud;
 
     // Skip objects that are entirely beyond valid depth range
+    //如果这个对象全都太远了 那就把这些点加入全局over_depth_object_cloud_ 这个对象被降级成远距离可疑主目标
     if (single_object_cloud->points.empty()) {
       if (!over_depth_object_cloud->points.empty()) {
         ROS_ERROR("Have all over depth object cloud!!!!");
@@ -210,7 +238,7 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
       }
       continue;
     }
-
+    //对剩余对象点云做 DBSCAN 去噪  保留主要簇，去掉散乱噪声点
     // Apply DBSCAN clustering to remove noise and outliers
     single_object_cloud = dbscan(single_object_cloud, 0.12f, 10);
     if (single_object_cloud == nullptr) {
@@ -223,7 +251,7 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
       continue;
     }
 
-    // Accumulate filtered object data
+    // Accumulate filtered object data  通过筛选的对象打包成DetectedObject
     *filtered_all_object_cloud += *single_object_cloud;
     DetectedObject detected_object;
     detected_object.cloud = single_object_cloud;
@@ -232,7 +260,8 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
     detected_objects.push_back(detected_object);
   }
 
-  // Maintain consistency in over-depth object tracking
+  // Maintain consistency in over-depth object tracking 
+  // 维护 over-depth cloud 的时间连续性 防止远距离目标一两帧抖动就突然消失 短时记忆/惯性保持机制 
   if (continue_over_depth_count_ == -1 &&
       !map_->object_map2d_->over_depth_object_cloud_->points.empty())
     continue_over_depth_count_ = 0;
@@ -245,13 +274,15 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
   }
 
   // Publish visualization point clouds for debugging and monitoring
-  publishPointCloud(filtered_object_cloud_pub_, filtered_all_object_cloud);
-  publishPointCloud(all_object_cloud_pub_, all_object_cloud);
-  publishPointCloud(over_depth_object_cloud_pub_, map_->object_map2d_->over_depth_object_cloud_);
+  publishPointCloud(filtered_object_cloud_pub_, filtered_all_object_cloud);//清洗后的对象总点云
+  publishPointCloud(all_object_cloud_pub_, all_object_cloud); //原始对象总点云
+  publishPointCloud(over_depth_object_cloud_pub_, map_->object_map2d_->over_depth_object_cloud_);//over-depth 主目标候选点云
 
   // Update object map with processed detection results
   *map_->object_map2d_->all_object_clouds_ = *filtered_all_object_cloud;
   vector<int> detected_object_cluster_ids;
+  //语义地图更新入口
+  //detected_object_cluster_ids :这一轮检测对象最终对应到了哪些对象簇 ID
   map_->inputObjectCloud2D(detected_objects, detected_object_cluster_ids);
 
   // Optional: Log detected object IDs for debugging
@@ -259,6 +290,7 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
   //   ROS_INFO("Detected object id is %d", object_id);
 
   // Extract observation data from depth sensor for objects not detected by vision
+  //用当前深度观测补一些“视觉没检到，但深度里能观察到”的对象相关信息
   getObservationObjectsCloud(detected_object_cluster_ids);
 
   double object_map_process_time = (ros::Time::now() - t1).toSec();
@@ -266,6 +298,7 @@ void MapROS::detectedObjectCloudCallback(const plan_env::MultipleMasksWithConfid
       10.0, "[Calculating Time] Object Map process time = %.3f s", object_map_process_time);
 }
 
+//更新局部esdf
 void MapROS::updateESDFCallback(const ros::TimerEvent& /*event*/)
 {
   if (!esdf_need_update_)
@@ -282,27 +315,33 @@ void MapROS::updateESDFCallback(const ros::TimerEvent& /*event*/)
   esdf_timer_.start();
 }
 
+//每来一组同步的“深度图 + 位姿”，它就把这一帧观测融合进 2D 几何地图，
+//并在此基础上更新 ValueMap，还顺手触发后续 ESDF 更新
 void MapROS::depthPoseCallback(
     const sensor_msgs::ImageConstPtr& img, const nav_msgs::OdometryConstPtr& pose)
 {
-  // Extract camera pose from odometry message
+  // Extract camera pose from odometry message 取当前相机位姿
   camera_pos_(0) = pose->pose.pose.position.x;
   camera_pos_(1) = pose->pose.pose.position.y;
   camera_pos_(2) = pose->pose.pose.position.z;
+  //当前姿态四元数
   camera_q_ = Eigen::Quaterniond(pose->pose.pose.orientation.w, pose->pose.pose.orientation.x,
       pose->pose.pose.orientation.y, pose->pose.pose.orientation.z);
 
-  // Calculate camera yaw angle for value map updates
+  // Calculate camera yaw angle for value map updates 从姿态中提取yaw,并转成2d位置
   Eigen::Vector3d euler =
       camera_q_.toRotationMatrix().eulerAngles(2, 1, 0);  // ZYX order: yaw, roll, pitch
   double camera_yaw = euler[0];
   Eigen::Vector2d camera_pos = Eigen::Vector2d(camera_pos_(0), camera_pos_(1));
 
-  // Skip processing if camera is outside map bounds
+  // Skip processing if camera is outside map bounds 如果相机已经跑出地图，就直接跳过
   if (!map_->isInMap(camera_pos))
     return;
 
   // Convert depth image format (Habitat publishes Float32, some sensors use 8UC1)
+  // ROS 深度图转成内部统一格式
+  // 把 ROS Image 转成 OpenCV cv::Mat
+  // 把不同深度图编码统一转成 CV_16UC1
   cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
   if (img->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
     (cv_ptr->image).convertTo(cv_ptr->image, CV_16UC1, k_depth_scaling_factor_);
@@ -313,36 +352,44 @@ void MapROS::depthPoseCallback(
   auto t1 = ros::Time::now();
 
   // Process depth image into 3D point cloud and filter to 2D representation
+  //把深度图投影成3d点云
   processDepthImage();
+  //把3d点云压成2d占据更新输入
   filterPointCloudToXY();
 
   // Update occupancy grid with filtered depth data
   vector<Eigen::Vector2i> free_grids;
   // Dilate free_grids to ensure more complete coverage
-  dilateGrids(free_grids, 1);
+  dilateGrids(free_grids, 1); //这个基本上没有用,应该放在free_grids后面吧 ,这是膨胀栅格的函数
+  //真正把这一帧点云融合进sdfmap2d   free_grids 当前这一帧视野里看到的free栅格
   map_->inputDepthCloud2D(filtered_depth_cloud2d_, camera_pos_, free_grids);
   double process_time = (ros::Time::now() - t1).toSec();
   ROS_INFO_THROTTLE(50.0, "[Calculating Time] Grid Map process time = %.3f s", process_time);
 
   t1 = ros::Time::now();
-  // Update semantic value map if ITM score is available
+  // Update semantic value map if ITM score is available  
+  //如果有itm分数就更新valuemap 把当前这一眼看到的自由区域附上这次图文匹配语义价值
   if (itm_score_ != -1.0)
     map_->value_map_->updateValueMap(camera_pos, camera_yaw, free_grids, itm_score_);
   double value_map_time = (ros::Time::now() - t1).toSec();
   ROS_INFO_THROTTLE(50.0, "[Calculating Time] Value Map process time = %.3f s", value_map_time);
 
   // Trigger ESDF update if local map has been updated
+  //如果这一帧真的导致了局部地图变化 那么先更新局部膨胀占据再把esdf_need_update置为true 
+  //下次updateESDFCallback() 定时器触发时，才会真正去重算 ESDF
   if (local_updated_) {
     map_->clearAndInflateLocalMap();
     esdf_need_update_ = true;
     local_updated_ = false;
   }
 }
-
+//把当前深度图逐像素投影成世界坐标系下的 3D 点云
 void MapROS::processDepthImage()
 {
+  //当前帧点计数
   proj_points_cnt_ = 0;
 
+  //图像宽高和当前相机姿态
   uint16_t* row_ptr;
   int cols = depth_image_->cols;
   int rows = depth_image_->rows;
@@ -350,35 +397,40 @@ void MapROS::processDepthImage()
   Eigen::Matrix3d camera_r = camera_q_.toRotationMatrix();
   Eigen::Vector3d pt_cur, pt_world;
   const double inv_factor = 1.0 / k_depth_scaling_factor_;
-
+  //按像素遍历深度图
   // Iterate through depth image pixels with margin and skipping for efficiency
+  // depth_filter_margin_:跳过图像边缘1圈  skip_pixel 每隔若干个像素取一个点
   for (int v = depth_filter_margin_; v < rows - depth_filter_margin_; v += skip_pixel_) {
     row_ptr = depth_image_->ptr<uint16_t>(v) + depth_filter_margin_;
     for (int u = depth_filter_margin_; u < cols - depth_filter_margin_; u += skip_pixel_) {
       // Convert pixel depth value to metric distance
+      //把像素深度值转成真实距离(m)
       depth = (*row_ptr) * inv_factor * (depth_filter_maxdist_ - depth_filter_mindist_) +
               depth_filter_mindist_;
       row_ptr = row_ptr + skip_pixel_;
 
+      //范围过滤,太远的截断,太近的直接丢掉
       // Apply depth range filtering
       if (depth > depth_filter_maxdist_)
         depth = depth_filter_maxdist_;
       else if (depth < depth_filter_mindist_)
         continue;
-
+      //把像素投影到相机坐标系3d点 标准针孔相机反投影  像素坐标+深度depth
       // Project pixel to 3D camera coordinates
       pt_cur(0) = (u - cx_) * depth / fx_;
       pt_cur(1) = (v - cy_) * depth / fy_;
       pt_cur(2) = depth;
-
+      //把点从相机系变到世界系 先旋转再平移
       // Transform to world coordinates
       pt_world = camera_r * pt_cur + camera_pos_;
+      //存进depth_cloud
       auto& pt = depth_cloud_->points[proj_points_cnt_++];
       pt.x = pt_world[0];
       pt.y = pt_world[1];
       pt.z = pt_world[2];
     }
   }
+  //发布点云做可视化
   publishPointCloud(depth_cloud_pub_, depth_cloud_);
 }
 
@@ -434,6 +486,8 @@ void MapROS::getObservationObjectsCloud(const std::vector<int>& filter_object_id
 /**
  * @brief Filter and process 3D point cloud to 2D occupancy grid
  */
+//从 3D 深度点云中提取对 2D 导航真正有用的平面障碍信息，
+//并在相机下视时补充虚拟地面点，生成最终用于 2D 占据建图的点云
 void MapROS::filterPointCloudToXY()
 {
   // Default ground height assumption (currently set to 0)

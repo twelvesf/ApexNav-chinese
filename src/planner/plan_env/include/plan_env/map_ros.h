@@ -52,6 +52,7 @@ using PointCloud2D = pcl::PointCloud<Point2D>;  ///< 2D point cloud type for occ
 namespace apexnav_planner {
 class SDFMap2D;
 
+//SDFMap2D 的 ROS 接口层
 class MapROS {
 public:
   MapROS() = default;
@@ -442,6 +443,7 @@ inline void MapROS::publishValueMap()
   value_map_pub_.publish(cloud_msg);
 }
 
+//发布3d点云
 inline void MapROS::publishPointCloud(
     const ros::Publisher& pub, const PointCloud3D::Ptr& point_cloud)
 {

@@ -13,36 +13,40 @@
 #include <plan_env/object_map2d.h>
 
 namespace apexnav_planner {
+//初始化对象语义地图模块。
 ObjectMap2D::ObjectMap2D(SDFMap2D* sdf_map, ros::NodeHandle& nh)
 {
   // Initialize core mapping components
-  this->sdf_map_ = sdf_map;
+  this->sdf_map_ = sdf_map;   //依赖sdfmap
+  //整个2d地图一共有多少个栅格单元
   int voxel_num = sdf_map_->getVoxelNum();
-  object_buffer_ = vector<char>(voxel_num, 0);  // Object occupancy flags per grid cell
-  object_indexs_ = vector<int>(voxel_num, -1);  // Object ID mapping per grid cell
+  //初始化对象栅格缓存
+  object_buffer_ = vector<char>(voxel_num, 0);  // 某个grid是否被对象占据
+  object_indexs_ = vector<int>(voxel_num, -1);  // 某个grid属于哪个对象id
 
-  // Initialize point cloud containers
-  all_object_clouds_.reset(new pcl::PointCloud<pcl::PointXYZ>());
-  over_depth_object_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
+  // Initialize point cloud containers 创建对象点云容器
+  all_object_clouds_.reset(new pcl::PointCloud<pcl::PointXYZ>()); //正常对象点云集合
+  over_depth_object_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());//超深度对象点云
 
   // Load configuration parameters
-  min_confidence_ = -1.0;  // Default to accept all detections
-  nh.param("object/min_observation_num", min_observation_num_, 2);
-  nh.param("object/fusion_type", fusion_type_, 1);
-  nh.param("object/use_observation", use_observation_, true);
-  nh.param("object/vis_cloud", is_vis_cloud_, false);
+  min_confidence_ = -1.0;  // Default to accept all detections 默认先不做严格置信度过滤
+  nh.param("object/min_observation_num", min_observation_num_, 2); //最少观测次数
+  nh.param("object/fusion_type", fusion_type_, 1);//融合方式  
+  nh.param("object/use_observation", use_observation_, true);//是否使用观测次数约束
+  nh.param("object/vis_cloud", is_vis_cloud_, false);//是否可视化对象点晕
 
-  // Setup ROS communication
+  // Setup ROS communication ros发布
   object_cloud_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/object/clouds", 10);
 
-  // Configure raycasting for spatial queries
+  // Configure raycasting for spatial queries 初始化raycaster
+  //raycaster_是一个2d射线投射工具
   raycaster_.reset(new RayCaster2D);
   resolution_ = sdf_map_->getResolution();
   Eigen::Vector2d origin, size;
   sdf_map_->getRegion(origin, size);
   raycaster_->setParams(resolution_, origin);
 
-  // Set point cloud processing parameters
+  // Set point cloud processing parameters  点云处理参数 
   leaf_size_ = 0.1f;  // Voxel grid leaf size for downsampling
 }
 
@@ -126,7 +130,7 @@ void ObjectMap2D::inputObservationObjectsCloud(
     }
   }
 }
-
+//把当前这一帧的单个检测对象，投到 2D 栅格上，判断它属于哪个已有对象簇；如果找不到，就新建一个对象簇
 int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object)
 {
   auto object_cloud = detected_object.cloud;
@@ -137,7 +141,8 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
   vector<Eigen::Vector2d> object_point2Ds;
   vector<char> flag_2d(sdf_map_->getVoxelNum(), 0);  // Duplicate point prevention
 
-  // Process each point in the detected object cloud
+  // Process each point in the detected object cloud 
+  //把这个对象点云逐点投到 2D 栅格上  对每个 3D 点取 x,y，用 posToIndex() 转成 2D grid
   for (int i = 0; i < point_num; i++) {
     Eigen::Vector2i idx;
     Eigen::Vector2d pt_w;
@@ -145,25 +150,27 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
     sdf_map_->posToIndex(pt_w, idx);
     int adr = sdf_map_->toAddress(idx);
 
-    // Skip duplicate grid cells
+    // Skip duplicate grid cells 去重
     if (flag_2d[adr] == 1)
       continue;
 
     flag_2d[adr] = 1;
 
-    // Validate if point satisfies object characteristics
+    // Validate if point satisfies object characteristics 过滤无效点
     if (isSatisfyObject(pt_w)) {
       object_buffer_[adr] = 1;  // Mark cell as containing object
       object_point2Ds.push_back(pt_w);
     }
   }
 
-  // Return early if no valid object points found
+  // Return early if no valid object points found 一个有效 2D 点都没有，直接失败
   if (object_point2Ds.empty()) {
     return -1;
   }
 
-  // Search for existing object clusters in neighborhood
+  // Search for existing object clusters in neighborhood 
+  //在邻域里查这个对象是不是已经属于某个已有簇
+  //对每个有效 2D 点，查它附近 0.08m 范围内的格子
   for (auto pt_w : object_point2Ds) {
     Eigen::Vector2i idx;
     sdf_map_->posToIndex(pt_w, idx);
@@ -172,7 +179,8 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
     auto nbrs = allGridsDistance(idx, 0.08);
     nbrs.push_back(idx);
 
-    // Check neighbors for existing object associations
+    // Check neighbors for existing object associations 
+    //只要邻域里某个格子已经挂了对象 ID，就认为当前对象可以并到那个已有簇
     for (auto nbr : nbrs) {
       int nbr_adr = sdf_map_->toAddress(nbr);
       if (object_indexs_[nbr_adr] != -1) {
@@ -183,7 +191,7 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
       }
     }
   }
-
+  //体素下采样  降低后面融合时的点数密度
   // Apply voxel grid filtering to reduce point cloud density
   pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
   voxel_filter.setInputCloud(object_cloud);
@@ -192,14 +200,15 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
 
   // Either merge with existing cluster or create new one
   if (obj_idx != -1) {
-    mergeCellsIntoObjectCluster(obj_idx, object_point2Ds, detected_object);
+    mergeCellsIntoObjectCluster(obj_idx, object_point2Ds, detected_object); //找到已有簇就合并
   }
   else {
-    createNewObjectCluster(object_point2Ds, detected_object);
+    createNewObjectCluster(object_point2Ds, detected_object);     //新建
     obj_idx = object_indexs_[toAdr(object_point2Ds[0])];
   }
 
-  // Update classification and visualization
+  // Update classification and visualization 
+  // 给这个对象簇选一个当前“最可信的语义标签”，写到 best_label_
   updateObjectBestLabel(obj_idx);
   if (is_vis_cloud_)
     publishObjectClouds();
@@ -212,16 +221,16 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
 
   return obj_idx;
 }
-
+//这个对象簇现在最像是什么类别
 void ObjectMap2D::updateObjectBestLabel(int obj_idx)
 {
   double max_func_score = 0.1;  // Minimum threshold for valid classification
   int best_label = -1;
 
-  // Evaluate each possible classification label
+  // Evaluate each possible classification label 遍历这个对象簇所有候选标签
   for (int label = 0; label < (int)objects_[obj_idx].clouds_.size(); label++) {
-    auto obs_sum = objects_[obj_idx].observation_cloud_sums_[label];
-    auto score = objects_[obj_idx].confidence_scores_[label];
+    auto obs_sum = objects_[obj_idx].observation_cloud_sums_[label];  //这个标签观测点数
+    auto score = objects_[obj_idx].confidence_scores_[label]; //这个标签的置信度有多高
     int func_score = obs_sum * score;  // Combined reliability metric
 
     if (func_score > max_func_score) {

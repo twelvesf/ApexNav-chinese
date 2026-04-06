@@ -2,7 +2,7 @@ import math
 import numpy as np
 import cv2
 
-
+# 把“深度图 + mask”转换成相机坐标系下的 3D 点云
 def get_point_cloud(
     depth_image: np.ndarray, mask: np.ndarray, fx: float, fy: float
 ) -> np.ndarray:
@@ -17,10 +17,13 @@ def get_point_cloud(
     Returns:
         np.ndarray: 3D points in camera coordinate system [z, -x, -y]
     """
+    # 找出mask中所有有效像素,取这些像素对应的深度值
     v, u = np.where(mask)
     z = depth_image[v, u]
+    # 用针孔相机模型把像素反投影成3d
     x = (u - depth_image.shape[1] // 2) * z / fx
     y = (v - depth_image.shape[0] // 2) * z / fy
+    # 重新组织坐标轴
     cloud = np.stack((z, -x, -y), axis=-1)
 
     return cloud
@@ -66,7 +69,7 @@ def xyz_yaw_to_tf_matrix(xyz: np.ndarray, yaw: float) -> np.ndarray:
     )
     return transformation_matrix
 
-
+# 判断一个目标 mask 是不是太贴近图像左右边缘
 def too_offset(mask: np.ndarray) -> bool:
     """
     Check if object mask is too close to image edges
@@ -80,8 +83,11 @@ def too_offset(mask: np.ndarray) -> bool:
     Returns:
         bool: True if object is too close to edges
     """
+    # 取 mask 的外接矩形
     x, y, w, h = cv2.boundingRect(mask)
+    # 把图像宽度分成三段
     third = mask.shape[1] // 3
+    # 如果目标整体在左侧区域,并且已经贴到最左侧百分之5区域则返回true,右侧同理
     if x + w <= third:
         return x <= int(0.05 * mask.shape[1])
     elif x >= 2 * third:

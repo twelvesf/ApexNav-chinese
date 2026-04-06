@@ -21,23 +21,23 @@ FrontierMap2D::FrontierMap2D(const SDFMap2D::Ptr& sdf_map, ros::NodeHandle& nh)
   int voxel_num = sdf_map_->getVoxelNum();
 
   // Allocate and initialize frontier state flags for all grid cells
-  frontier_flag_ = vector<char>(voxel_num, NONE);
+  frontier_flag_ = vector<char>(voxel_num, NONE);//记录每个 grid 当前属于什么 frontier 状态。
   fill(frontier_flag_.begin(), frontier_flag_.end(), NONE);
 
   // Load exploration parameters from ROS parameter server
-  nh.param("frontier/cluster_min", cluster_min_, -1);
-  nh.param("frontier/cluster_size_xy", cluster_size_xy_, -1.0);
-  nh.param("frontier/min_contain_unknown", min_contain_unknown_, 50);
-  nh.param("frontier/min_view_finish_fraction", min_view_finish_fraction_, -1.0);
+  nh.param("frontier/cluster_min", cluster_min_, -1); //cluster至少多大
+  nh.param("frontier/cluster_size_xy", cluster_size_xy_, -1.0); //cluster分裂尺度
+  nh.param("frontier/min_contain_unknown", min_contain_unknown_, 50); //frontier附近至少要有多少unknown材质的保留
+  nh.param("frontier/min_view_finish_fraction", min_view_finish_fraction_, -1.0);//变化检测/完成判定阈值
 
-  // Initialize ray-casting system for visibility analysis
+  // Initialize ray-casting system for visibility analysis 初始化2d raycaster
   raycaster_.reset(new RayCaster2D);
   resolution_ = sdf_map_->getResolution();
   Eigen::Vector2d origin, size;
   sdf_map_->getRegion(origin, size);
   raycaster_->setParams(resolution_, origin);
 
-  // Setup perception utilities for sensor integration
+  // Setup perception utilities for sensor integration 初始化感知工具
   percep_utils_.reset(new PerceptionUtils2D(nh));
 }
 

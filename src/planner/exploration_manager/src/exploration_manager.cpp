@@ -45,9 +45,10 @@ void ExplorationManager::initialize(ros::NodeHandle& nh)
   nh.param("exploration/tsp_dir", ep_->tsp_dir_, string("null"));
 
   // Get map parameters for ray casting initialization
-  double resolution = sdf_map_->getResolution();
+  //从 SDFMap2D 里取出地图的基础几何参数
+  double resolution = sdf_map_->getResolution();//地图分辨率
   Eigen::Vector2d origin, size;
-  sdf_map_->getRegion(origin, size);
+  sdf_map_->getRegion(origin, size);//origin 地图原点  size  地图整体尺寸
 
   // Initialize ray caster for collision checking and TSP service client
   ray_caster2d_.reset(new RayCaster2D);

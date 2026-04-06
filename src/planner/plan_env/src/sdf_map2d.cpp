@@ -48,6 +48,7 @@ SDFMap2D::~SDFMap2D() = default;
  */
 void SDFMap2D::initMap(ros::NodeHandle& nh)
 {
+  // mp_:存地图的参数配置 md_:存地图运行时的实际数据buffer map_ros:负责地图和ros的接口层
   mp_.reset(new MapParam2D);
   md_.reset(new MapData2D);
   map_ros_.reset(new MapROS);
@@ -112,7 +113,7 @@ void SDFMap2D::initMap(ros::NodeHandle& nh)
   mp_->unknown_flag_ = 0.01;
   ROS_INFO("prob_hit_log = %f, prob_miss_log = %f", mp_->prob_hit_log_, mp_->prob_miss_log_);
 
-  // Initialize map data structures and buffers
+  // Initialize map data structures and buffers 分配和初始化各种buffer
   mp_->buffer_size_ = mp_->map_voxel_num_(0) * mp_->map_voxel_num_(1);
   md_->occupancy_buffer_ =
       vector<double>(mp_->buffer_size_, mp_->clamp_min_log_ - mp_->unknown_flag_);
@@ -133,11 +134,11 @@ void SDFMap2D::initMap(ros::NodeHandle& nh)
   md_->update_min_ = md_->update_max_ = Eigen::Vector2i(0, 0);
   md_->update_mind_ = md_->update_maxd_ = Eigen::Vector2d(0, 0);
 
-  // Initialize ROS components and raycaster
+  // Initialize ROS components and raycaster 初始化附属模块并且接上ros
   object_map2d_.reset(new ObjectMap2D(this, nh));
   value_map_.reset(new ValueMap(this, nh));
   map_ros_->setMap(this);
-  map_ros_->node_ = nh;
+  map_ros_->node_ = nh; //把ros nodehandle交给mapros
   map_ros_->init();
 
   caster_.reset(new RayCaster2D);
@@ -201,9 +202,7 @@ void SDFMap2D::inputVirtualGround(const pcl::PointCloud<pcl::PointXY>::Ptr& poin
 /**
  * @brief 将目标检测结果融合进持久化对象地图。
  *
- * 每个检测结果都包含目标点云、标签和置信度。该函数本身不做复杂的
- * 融合逻辑，而是把每个有效检测转交给 `ObjectMap2D` 处理，由它判断：
- * 当前检测应当并入已有对象簇，还是创建一个新的对象簇。
+ * 把当前这一帧检测到的对象列表，逐个送进 ObjectMap2D 做对象簇匹配/融合，并返回这批对象最终匹配到的簇 ID
  *
  * 函数最终返回本轮被成功匹配或新建的对象簇编号，供调用者继续做
  * 观测一致性处理、语义更新或调试可视化。
@@ -219,7 +218,11 @@ void SDFMap2D::inputObjectCloud2D(
   for (auto detected_object : detected_objects) {
     if (detected_object.cloud->points.empty())
       continue;
-
+    //真正的对象融合逻辑
+    // 让 ObjectMap2D 判断这个新对象应该：
+    // 归并到某个已有对象簇
+    // 还是新建一个对象簇
+    // 或者不保留
     int object_cluster_id = object_map2d_->searchSingleObjectCluster(detected_object);
     if (object_cluster_id != -1)
       object_cluster_ids.push_back(object_cluster_id);
@@ -567,10 +570,11 @@ void SDFMap2D::fillESDF(F_get_val f_get_val, F_set_val f_set_val, int start, int
 void SDFMap2D::updateESDFMap()
 {
   // Update Euclidean Signed Distance Field within local bounds
+  //只在最近更新过的局部范围内重算esdf
   Eigen::Vector2i min_esdf = md_->local_bound_min_;
   Eigen::Vector2i max_esdf = md_->local_bound_max_;
 
-  // First pass: compute distance transform along Y-axis
+  // First pass: compute distance transform along Y-axis 沿y方向做距离变换
   if (mp_->optimistic_) {
     // Optimistic mode: only consider known occupied cells
     for (int x = min_esdf[0]; x <= max_esdf[0]; x++) {
@@ -600,7 +604,8 @@ void SDFMap2D::updateESDFMap()
     }
   }
 
-  // Second pass: compute distance transform along X-axis
+  // Second pass: compute distance transform along X-axis 
+  // 沿x方向做距离变换  最终存的是以米为单位的真实距离。
   for (int y = min_esdf[1]; y <= max_esdf[1]; y++) {
     fillESDF([&](int x) { return md_->tmp_buffer_[toAddress(x, y)]; },
         [&](int x, double val) {
@@ -608,7 +613,7 @@ void SDFMap2D::updateESDFMap()
         },
         min_esdf[0], max_esdf[0], 0);
   }
-
+  //如果开启 signed distance，再算内部负距离
   // Compute signed distance field if requested
   if (mp_->signed_dist_) {
     // Compute negative distances (inside obstacles)
@@ -635,6 +640,7 @@ void SDFMap2D::updateESDFMap()
     for (int x = min_esdf[0]; x <= max_esdf[0]; x++) {
       for (int y = min_esdf[1]; y <= max_esdf[1]; y++) {
         int idx = toAddress(x, y);
+        //合并成 signed distance field
         if (md_->distance_buffer_neg_[idx] > 0.0)
           md_->distance_buffer_[idx] += (-md_->distance_buffer_neg_[idx] + mp_->resolution_);
       }
@@ -657,12 +663,14 @@ void SDFMap2D::updateESDFMap()
 void SDFMap2D::clearAndInflateLocalMap()
 {
   // Clear previous inflation and inflate obstacles in local map area
+  //膨胀半径对应多少格
   int inf_step = ceil(mp_->obstacles_inflation_ / mp_->resolution_);
   vector<Eigen::Vector2i> inf_pts;
   Eigen::Vector2i range_min = md_->local_update_min_;
   Eigen::Vector2i range_max = md_->local_update_max_;
 
-  // Clear inflation for voxels that changed from occupied to free
+  // Clear inflation for voxels that changed from occupied to free 
+  // 先清掉“原来是障碍，现在不是障碍”的旧膨胀
   for (auto idx : md_->occupancy_need_clear_) {
     inflatePoint(idx, inf_step, inf_pts);
     for (auto& inf_pt : inf_pts) {
@@ -673,11 +681,13 @@ void SDFMap2D::clearAndInflateLocalMap()
     }
   }
 
+  //再对当前新的 occupied 格子重新膨胀
   // Inflate newly occupied voxels
   for (int x = range_min(0); x <= range_max(0); ++x)
     for (int y = range_min(1); y <= range_max(1); ++y) {
       int id1 = toAddress(x, y);
       if (md_->occupancy_buffer_[id1] > mp_->min_occupancy_log_) {
+        //给定一个中心格子，返回它周围需要被膨胀到的那些格子
         inflatePoint(Eigen::Vector2i(x, y), inf_step, inf_pts);
 
         for (auto& inf_pt : inf_pts) {

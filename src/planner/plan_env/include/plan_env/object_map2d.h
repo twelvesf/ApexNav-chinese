@@ -201,7 +201,7 @@ inline bool ObjectMap2D::isSatisfyObject(const Eigen::Vector2i& idx)
   sdf_map_->indexToPos(idx, pos);
   return isSatisfyObject(pos);
 }
-
+//这个点在地图范围内并且2d栅格被占据就可以算作object点
 inline bool ObjectMap2D::isSatisfyObject(const Eigen::Vector2d& pos)
 {
   if (sdf_map_->isInMap(pos) && sdf_map_->getOccupancy(pos) == SDFMap2D::OCCUPIED)
@@ -271,12 +271,12 @@ inline vector<Eigen::Vector2i> ObjectMap2D::allNeighbors(const Eigen::Vector2i& 
   }
   return neighbors;
 }
-
+//给定一个中心栅格 idx 和距离 dist，返回这个半径内所有邻近栅格
 inline vector<Eigen::Vector2i> ObjectMap2D::allGridsDistance(
     const Eigen::Vector2i& idx, const double& dist)
 {
   vector<Eigen::Vector2i> grids;
-  int cnt = ceil(dist / resolution_);  // Convert distance to grid cells
+  int cnt = ceil(dist / resolution_);  // Convert distance to grid cells 物理距离转为栅格
 
   for (int x = -cnt; x <= cnt; ++x) {
     for (int y = -cnt; y <= cnt; ++y) {

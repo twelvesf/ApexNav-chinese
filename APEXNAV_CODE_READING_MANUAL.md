@@ -209,21 +209,140 @@
 
 ### 6.2 语义地图链
 
-`VLM 检测结果 -> /detector/clouds_with_scores -> MapROS::detectedObjectCloudCallback -> ObjectMap2D`
+这里原来容易写错的地方是：`ApexNav` 的“语义地图”不是一张图，而是两种并行表征：
 
-`ITM 分数 -> /blip2/cosine_score -> MapROS::itmScoreCallback -> ValueMap::updateValueMap`
+1. `ObjectMap2D`：对象级语义实体图  
+   回答“哪里有目标/相似物对象，置信度如何”
+2. `ValueMap`：连续空间语义价值图  
+   回答“当前自由空间里，哪里在语义上更像目标相关区域”
+
+按你实际测试时的运行方式，这条链路应当这样理解。
+
+#### 前端输入是谁产生的
+
+运行：
+
+- `python -m vlm.detector.grounding_dino --port 12181`
+- `python -m vlm.itm.blip2itm --port 12182`
+- `python -m vlm.segmentor.sam --port 12183`
+- `python -m vlm.detector.yolov7 --port 12184`
+- `python habitat_vel_control.py`
+- `python ./real_world_test_example/real_world_test_habitat.py`
+
+其中：
+
+- [`habitat_vel_control.py`](./habitat_vel_control.py) 通过 [`habitat_publisher.py`](./habitat2ros/habitat_publisher.py) 发布
+  - `/habitat/camera_rgb`
+  - `/habitat/camera_depth`
+  - `/habitat/sensor_pose`
+  - `/habitat/odom`
+  - `/detector/label`
+- [`real_world_test_habitat.py`](./real_world_test_example/real_world_test_habitat.py) 是真正的语义前端
+  - `sync_detect_callback()`：
+    `RGB + depth + sensor_pose -> get_object(YOLOv7/GroundingDINO + SAM) -> get_object_point_cloud -> /detector/clouds_with_scores`
+  - `sync_value_callback()`：
+    `RGB -> get_itm_message_cosine(BLIP2-ITM cosine) -> /blip2/cosine_score`
+
+#### `ObjectMap2D` 是怎么形成的
+
+对象级语义链路是：
+
+`/detector/clouds_with_scores -> MapROS::detectedObjectCloudCallback -> inputObjectCloud2D -> ObjectMap2D`
+
+这里不是简单“收到点云就存起来”，中间还做了：
+
+- ROS `PointCloud2` 转 PCL
+- voxel downsample
+- 超量程点过滤
+- DBSCAN 去噪
+- `label == 0` 的 over-depth object 维护
+- `ObjectMap2D` 内部对象聚类与多次观测融合
+
+所以 `ObjectMap2D` 形成的是：
+
+- 离散对象簇
+- 每个对象的 `best_label`
+- 每个标签的 `confidence_scores_`
+- `good_cells_`
+- `over_depth_object_cloud_`
+
+#### `ValueMap` 是怎么形成的
+
+这里最容易误解。
+
+不是：
+
+`/blip2/cosine_score -> itmScoreCallback -> 直接更新 ValueMap`
+
+实际代码是两步：
+
+1. [`MapROS::itmScoreCallback`](./src/planner/plan_env/src/map_ros.cpp)  
+   只把最新的 `itm_score_` 缓存在 `MapROS` 里
+2. [`MapROS::depthPoseCallback`](./src/planner/plan_env/src/map_ros.cpp)  
+   在处理当前深度图、得到当前视场覆盖的 `free_grids` 之后，才调用  
+   `ValueMap::updateValueMap(camera_pos, camera_yaw, free_grids, itm_score_)`
+
+也就是说，`ValueMap` 的形成逻辑是：
+
+`depth + sensor_pose -> 当前视场 free_grids`
+
+`最新缓存的 itm_score + 当前 camera_pos/camera_yaw + free_grids -> ValueMap::updateValueMap`
+
+这意味着：
+
+- `ValueMap` 不是由目标检测框直接生成的
+- `itmScoreCallback()` 只是缓存分数，不负责落图
+- 真正的语义落图发生在 `depthPoseCallback()` 里
+- 语义值只会投到“当前视场里可见的自由空间格子”上，而不是投到 object cells 上
+
+[`value_map2d.cpp`](./src/planner/plan_env/src/value_map2d.cpp) 里具体做的是：
+
+- 对每个 `free_grid`
+- 根据它相对相机光轴的夹角计算一个 `FOV confidence`
+- 用 `itm_score` 和历史 `value_buffer_ / confidence_buffer_` 做加权融合
+
+所以 `ValueMap` 的本质不是“对象语义图”，而是：
+
+**一张由视场观测不断累积得到的、连续空间上的语义价值图。**
+
+#### 这两张语义地图最后怎么被使用
+
+在 [`ExplorationManager::planNextBestPoint`](./src/planner/exploration_manager/src/exploration_manager.cpp) 里，两者分工完全不同：
+
+- `ObjectMap2D`
+  - 先被用来取高置信目标对象
+  - 决定是否进入 `SEARCH_BEST_OBJECT / SEARCH_OVER_DEPTH_OBJECT / SEARCH_SUSPICIOUS_OBJECT`
+  - 更像“对象驱动接近”
+
+- `ValueMap`
+  - 不直接触发追对象
+  - 而是在 `getSortedSemanticFrontiers()`、`findHighestSemanticsFrontierPolicy()`、`hybridExplorePolicy()` 里
+    通过 `value_map_->getValue(...)` 给 frontier 附近区域打语义分
+  - 更像“语义驱动 frontier 排序”
+
+所以最终决策逻辑不是“先做一张统一语义图再全都用同一种方式消费”，而是：
+
+- `ObjectMap2D` 负责对象级确认与接近
+- `ValueMap` 负责空间级语义偏好
+- `ExplorationManager` 把两者和 `FrontierMap2D` 一起融合成下一步搜索决策
 
 对应文件：
 
 - [`real_world_test_habitat.py`](./real_world_test_example/real_world_test_habitat.py)
+- [`habitat_vel_control.py`](./habitat_vel_control.py)
+- [`habitat_publisher.py`](./habitat2ros/habitat_publisher.py)
 - [`map_ros.cpp`](./src/planner/plan_env/src/map_ros.cpp)
 - [`object_map2d.cpp`](./src/planner/plan_env/src/object_map2d.cpp)
 - [`value_map2d.cpp`](./src/planner/plan_env/src/value_map2d.cpp)
 
-结果：
+一句话总结这一段：
 
-- `ObjectMap2D` 维护“哪里像目标对象、置信度多高”
-- `ValueMap` 维护“哪里在语义上更像目标相关区域”
+`ApexNav` 的语义输入不是“检测结果直接变成语义地图”，而是分成两路：
+
+- 检测点云进入 `ObjectMap2D`
+- ITM 分数结合深度视场进入 `ValueMap`
+
+然后再由 `ExplorationManager` 以“对象优先、frontier 次之、语义排序辅助”的方式统一消费。
 
 ### 6.3 决策链
 

@@ -184,7 +184,7 @@ class RealWorldNode:
             "/habitat/sensor_pose", Odometry
         )
 
-        # 里程计订阅器：订阅机器人里程计数据，用于位置跟踪
+        # 里程计订阅器：订阅机器人里程计数据，用于位置跟踪  看起来根本没用上
         # queue_size=10 表示消息队列长度，防止消息积压
         rospy.Subscriber("/habitat/odom", Odometry, self.odom_callback, queue_size=10)
 
@@ -316,7 +316,7 @@ class RealWorldNode:
             return
         self.processing_detect = True
         try:
-            # 时间戳同步验证
+            # 时间戳同步验证  应该是老代码，现在没有用
             stamp = rgb_msg.header.stamp
             time_diff = abs((stamp - sensor_pose_msg.header.stamp).to_sec())
             if time_diff > 0.1:
@@ -328,7 +328,9 @@ class RealWorldNode:
             depth_img = self.bridge.imgmsg_to_cv2(
                 depth_msg, desired_encoding="passthrough"
             )
+            #深度图显式转换成float32
             transform_depth_img = depth_img.astype(np.float32)
+            # 2维变三维
             depth_cv = np.expand_dims(transform_depth_img, axis=-1)
 
             # 初始化结果消息
@@ -349,6 +351,8 @@ class RealWorldNode:
             )
 
             # 使用逆变换恢复原始Habitat观察格式
+        # - gps: Habitat格式的GPS位置 [x, y, z] (numpy数组, float32)
+        # - compass: Habitat格式的朝向角度 [角度] (numpy数组, float32)
             gps, compass = inverse_habitat_publisher_transform(sensor_pose_msg)
 
             observations = {
@@ -378,6 +382,7 @@ class RealWorldNode:
             # 标记处理完成，以便下一次调用可以进行
             self.processing_detect = False
 
+#对当前同步到的一帧 RGB 图像，计算它和目标文本的语义相似度，并把这个分数发布给规划侧的 ValueMap。
     def sync_value_callback(self, rgb_msg, depth_msg, sensor_pose_msg):
         """
         价值评估同步回调函数
@@ -427,6 +432,7 @@ class RealWorldNode:
             rospy.loginfo("value: Computed cosine score: %.3f", cosine)
 
             # 封装并发布ITM分数
+            # 创建一个 std_msgs/Float64 类型的消息实例
             itm_score_msg = Float64()
             itm_score_msg.data = cosine
             self.itm_score_pub_.publish(itm_score_msg)
@@ -476,7 +482,7 @@ class RealWorldNode:
 
             # 如果LLM已配置，获取增强答案
             try:
-                # 从LLM获取目标的详细描述、房间信息和融合阈值
+                # 从LLM获取目标的详细描述、房间信息和融合阈值 这个融合阈值似乎没用上
                 self.llm_answer, self.room, self.fusion_score = read_answer(
                     self.llm_answer_path,    # LLM答案文件路径
                     self.llm_response_path,  # LLM响应文件路径
@@ -580,7 +586,7 @@ class RealWorldNode:
         rospy.spin()
 
     # ===== 主程序入口 =====
-
+#hydra传入配置文件 real_world_test.yaml  赋值给cfg
 @hydra.main(version_base=None, config_path="config", config_name="real_world_test")
 def main(cfg: DictConfig):
     """

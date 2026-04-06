@@ -67,7 +67,7 @@ class MobileSAM:
 class MobileSAMClient:
     def __init__(self, port: int = 12183):
         self.url = f"http://localhost:{port}/mobile_sam"
-
+# 给定图像和检测框，让 SAM 抠出目标像素区域。
     def segment_bbox(self, image: np.ndarray, bbox: List[int]) -> np.ndarray:
         response = send_request(self.url, image=image, bbox=bbox)
         cropped_mask_str = response["cropped_mask"]
