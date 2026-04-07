@@ -1,4 +1,54 @@
 # ApexNav Code Reading Manual
+我的总结:
+
+视觉前端
+vlm/detector/grounding_dino.py  
+<!-- //GroundingDINO 的模型封装 + 客户端/服务端接口层 
+输出：哪些位置可能有这些物体的 bounding box 检测框，以及对应分数、类别文字 -->
+
+vlm/itm/blip2itm.py
+<!-- # BLIP2：视觉语言模型   图像文本匹配打分器  
+# cosine：适合“前方整体看起来像不像目标相关区域”
+# itm_score：适合“这个候选框到底是不是目标”
+# Client-Server工程封装  -->
+
+segmentor/sam.py
+<!-- # 输入groundingdino/yolo传来的框，输出分割mask  mobilesam：扣出框内的目标像素
+# mask : 与图像同尺寸的二值区域图，用来表示哪些图像属于目标哪些不属于 -->
+
+vlm/detector/yolov7.py
+<!-- # YOLOv7：固定类别检测器，适合常见物体，快、直接 -->
+
+
+主要算法:
+## ApexNav/src/planner/exploration_manager/launch/exploration_traj.launch  主算法启动launch
+# ApexNav/src/planner/exploration_manager/launch/algorithm_traj.xml 真正启动算法的xml文件  同时配置参数
+   ApexNav/src/planner/exploration_manager/src/exploration_node.cpp  
+   * 该节点是ApexNav探索系统的入口点，负责根据配置参数选择仿真模式或真实世界模式的有限状态机进行自主探索任务
+   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## 1. 这份手册解决什么问题
 
